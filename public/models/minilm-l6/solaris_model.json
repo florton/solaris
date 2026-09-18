@@ -1,0 +1,16 @@
+{
+  "id": "sentence-transformers/all-MiniLM-L6-v2",
+  "params": 22713216,
+  "layers": 6,
+  "hiddenDim": 384,
+  "dtype": "q8",
+  "outputs": [
+    "hidden_state_0",
+    "hidden_state_1",
+    "hidden_state_2",
+    "hidden_state_3",
+    "hidden_state_4",
+    "hidden_state_5",
+    "hidden_state_6"
+  ]
+}

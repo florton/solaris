@@ -1,0 +1,22 @@
+{
+  "name": "solaris",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "spike": "esbuild src/geometry.ts --format=esm --outfile=.probe/geometry.mjs && node scripts/spike2.mjs",
+    "test:geometry": "esbuild src/geometry.ts --format=esm --outfile=.probe/geometry.mjs && node scripts/geometry-test.mjs",
+    "export-model": ".venv/Scripts/python scripts/export_model.py"
+  },
+  "dependencies": {
+    "onnxruntime-web": "1.22.0-dev.20250409-89f8206ba4"
+  },
+  "devDependencies": {
+    "@huggingface/transformers": "^3.7.2",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.5"
+  }
+}
