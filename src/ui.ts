@@ -11,8 +11,6 @@ export interface Stats {
   eigenMs: number;
   tokens: number;
   layers: number;
-  vertices: number;
-  edges: number;
   fps: number;
   offline?: string;
 }
@@ -58,7 +56,7 @@ export class UI {
     this.readout.textContent =
       `${s.modelName} · ${(s.params / 1e6).toFixed(1)}M params · ${s.dtype} · ${s.backend}\n` +
       `load ${m(s.loadMs)} · fwd ${m(s.forwardMs)} · eigen ${m(s.eigenMs)} · ` +
-      `${s.tokens} tokens × ${s.layers} layers · ${s.vertices} blobs · ${s.edges} strands · ${s.fps} fps` +
+      `${s.tokens} tokens × ${s.layers} layers · ${s.fps} fps` +
       (s.offline ? `\n${s.offline}` : '');
   }
 

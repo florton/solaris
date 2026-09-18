@@ -6,16 +6,9 @@
 // stack and layer-to-layer reorganization reads as morphing, not teleporting.
 // Color is per token and stable across layers: hue comes from the token's
 // angular position in the final layer's embedding, so tokens the model holds
-// together share color families and the inter-layer strands read as colored
-// threads running through the depth axis.
-// Edges: intra-layer association ribbons + inter-layer identity strands
-// (same token, adjacent layers) so the stack reads as one object
-// re-organizing through depth.
+// together share color families and the body reads as colored regions.
 import { layerGeometry, procrustesAlign } from './geometry.ts';
 import type { ForwardResult } from './model.ts';
-
-export const EDGE_INTRA = 0;
-export const EDGE_INTER = 1;
 
 export interface Sculpture {
   tokens: string[];
@@ -27,16 +20,11 @@ export interface Sculpture {
   brightness: Float32Array; // per-vertex base brightness (normalized salience)
   colors: Float32Array; // rgb per vertex, per-token hue
   tokenOf: Uint16Array; // vertex -> token index
-  edgeIndices: Uint32Array; // 2 per edge
-  edgeWeights: Float32Array; // 0..1 per edge
-  edgeKind: Uint8Array; // EDGE_INTRA | EDGE_INTER per edge
-  edgeCount: number;
   eigenMs: number;
 }
 
 const WORLD_RADIUS = 2.0;
 const W_SPAN = 1.5; // half-extent of the layer axis
-const INTER_LAYER_WEIGHT = 0.05;
 
 function hsl2rgb(h: number, s: number, l: number): [number, number, number] {
   const a = s * Math.min(l, 1 - l);
@@ -58,9 +46,6 @@ export function buildSculpture(result: ForwardResult): Sculpture {
   const brightness = new Float32Array(vertexCount);
   const colors = new Float32Array(vertexCount * 3);
   const tokenOf = new Uint16Array(vertexCount);
-  const edgeIdx: number[] = [];
-  const edgeW: number[] = [];
-  const edgeKind: number[] = [];
 
   let prevAligned: Float32Array | null = null;
   let lastPositions: Float32Array = new Float32Array(0);
@@ -98,19 +83,6 @@ export function buildSculpture(result: ForwardResult): Sculpture {
       wCoords[v] = wOf(l);
       brightness[v] = 0.35 + 0.65 * (g.salience[i] / maxSal);
       tokenOf[v] = i;
-    }
-    for (const [i, j, w] of g.edges) {
-      edgeIdx.push(l * n + i, l * n + j);
-      edgeW.push(w);
-      edgeKind.push(EDGE_INTRA);
-    }
-    // identity strands to the next layer
-    if (l < nLayers - 1) {
-      for (let i = 0; i < n; i++) {
-        edgeIdx.push(l * n + i, (l + 1) * n + i);
-        edgeW.push(INTER_LAYER_WEIGHT);
-        edgeKind.push(EDGE_INTER);
-      }
     }
   }
 
@@ -157,10 +129,6 @@ export function buildSculpture(result: ForwardResult): Sculpture {
     brightness,
     colors,
     tokenOf,
-    edgeIndices: Uint32Array.from(edgeIdx),
-    edgeWeights: Float32Array.from(edgeW),
-    edgeKind: Uint8Array.from(edgeKind),
-    edgeCount: edgeW.length,
     eigenMs: performance.now() - t0,
   };
 }

@@ -46,21 +46,30 @@ async function runThought(text: string): Promise<void> {
 function pickToken(x: number, y: number): { token: string; sx: number; sy: number } | null {
   if (!sculpture) return null;
   const proj = renderer.projectVertices();
-  let best = -1;
-  let bestD = 26; // px threshold
+  // candidates: near the pointer and near the focal layer
+  const hits: number[] = [];
+  let nearestDepth = Infinity;
   for (let v = 0; v < sculpture.vertexCount; v++) {
-    const alpha = proj[v * 3 + 2];
-    if (alpha < 0.25) continue;
-    const dx = proj[v * 3] - x;
-    const dy = proj[v * 3 + 1] - y;
-    const d = Math.hypot(dx, dy);
+    if (proj[v * 4 + 2] < 0.25) continue;
+    const d = Math.hypot(proj[v * 4] - x, proj[v * 4 + 1] - y);
+    if (d > 30) continue;
+    hits.push(v);
+    nearestDepth = Math.min(nearestDepth, proj[v * 4 + 3]);
+  }
+  if (!hits.length) return null;
+  // of the candidates, prefer the front shell of the form
+  let best = -1;
+  let bestD = Infinity;
+  for (const v of hits) {
+    if (proj[v * 4 + 3] > nearestDepth + 1.0) continue;
+    const d = Math.hypot(proj[v * 4] - x, proj[v * 4 + 1] - y);
     if (d < bestD) {
       bestD = d;
       best = v;
     }
   }
   if (best < 0) return null;
-  return { token: sculpture.tokens[sculpture.tokenOf[best]], sx: proj[best * 3], sy: proj[best * 3 + 1] };
+  return { token: sculpture.tokens[sculpture.tokenOf[best]], sx: proj[best * 4], sy: proj[best * 4 + 1] };
 }
 
 function wireInteraction(): void {
@@ -136,8 +145,6 @@ function updateStats(): void {
     eigenMs: lastEigenMs,
     tokens: sculpture.nTokens,
     layers: sculpture.nLayers,
-    vertices: sculpture.vertexCount,
-    edges: sculpture.edgeCount,
     fps: Math.round(fps),
     offline: cacheReport || undefined,
   });
