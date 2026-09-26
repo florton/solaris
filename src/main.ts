@@ -15,6 +15,8 @@ let sculpture: Sculpture | null = null;
 let loadMs = 0;
 let lastForwardMs = 0;
 let lastEigenMs = 0;
+let lastFormMs: number | undefined;
+let lastFormGrid: number | undefined;
 
 // interaction state
 let dragging = false;
@@ -31,6 +33,7 @@ async function runThought(text: string): Promise<void> {
   ui.hideLabel(true);
   const result = await model.forward(text);
   sculpture = buildSculpture(result);
+  renderer.resetVolumes();
   renderer.setSculpture(sculpture);
   // the sculpture *appears*: sweep up the layer axis from below the stack
   renderer.focus = -(W_SPAN + 0.6);
@@ -39,8 +42,27 @@ async function runThought(text: string): Promise<void> {
   ui.buildGauge(sculpture.nLayers);
   lastForwardMs = result.forwardMs;
   lastEigenMs = sculpture.eigenMs;
+  lastFormMs = undefined;
+  lastFormGrid = undefined;
   history.replaceState(null, '', encodePermalink(text));
   updateStats();
+
+  // kick the imagination: pooled layer embeddings -> latents -> SDF grids,
+  // arriving per layer while the thought cloud holds the stage
+  const sc = sculpture;
+  const mat = model.materialize(result, (layer, sdf, grid) => {
+    if (sculpture !== sc) return; // superseded by a newer thought
+    if (renderer.volCount === 0) renderer.initVolumes(sc.nLayers, grid, model.imagination!.bound);
+    renderer.setLayerVolume(layer, sdf);
+    if (renderer.volCount === sc.nLayers) renderer.matTarget = 1; // condense
+  });
+  void mat?.then((r) => {
+    if (r && sculpture === sc) {
+      lastFormMs = r.ms;
+      lastFormGrid = r.grid;
+      updateStats();
+    }
+  });
 }
 
 function pickToken(x: number, y: number): { token: string; sx: number; sy: number } | null {
@@ -146,6 +168,8 @@ function updateStats(): void {
     tokens: sculpture.nTokens,
     layers: sculpture.nLayers,
     fps: Math.round(fps),
+    formMs: lastFormMs,
+    formGrid: lastFormGrid,
     offline: cacheReport || undefined,
   });
 }
@@ -216,6 +240,8 @@ async function cacheEverything(): Promise<string> {
       'models/minilm-l6/solaris_model.json',
       'models/minilm-l6/vocab.txt',
       'models/minilm-l6/onnx/model_quantized.onnx',
+      'models/imagination/imagination_model.json',
+      'models/imagination/decoder.onnx',
       'ort/ort-wasm-simd-threaded.jsep.wasm',
       'ort/ort-wasm-simd-threaded.jsep.mjs',
       'ort/ort-wasm-simd-threaded.wasm',

@@ -4,3 +4,8 @@ dist/
 .export/
 .probe/
 *.local
+data/objaverse/
+data/mimoid/
+data/*.npz
+data/*.pt
+scripts/__pycache__/

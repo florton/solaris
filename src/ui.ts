@@ -12,6 +12,8 @@ export interface Stats {
   tokens: number;
   layers: number;
   fps: number;
+  formMs?: number;
+  formGrid?: number;
   offline?: string;
 }
 
@@ -57,6 +59,7 @@ export class UI {
       `${s.modelName} · ${(s.params / 1e6).toFixed(1)}M params · ${s.dtype} · ${s.backend}\n` +
       `load ${m(s.loadMs)} · fwd ${m(s.forwardMs)} · eigen ${m(s.eigenMs)} · ` +
       `${s.tokens} tokens × ${s.layers} layers · ${s.fps} fps` +
+      (s.formMs !== undefined && s.formGrid ? `\nimagination · form ${m(s.formMs)} · ${s.formGrid}³ grid` : '') +
       (s.offline ? `\n${s.offline}` : '');
   }
 

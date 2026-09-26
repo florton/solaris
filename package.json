@@ -9,7 +9,11 @@
     "preview": "vite preview",
     "spike": "esbuild src/geometry.ts --format=esm --outfile=.probe/geometry.mjs && node scripts/spike2.mjs",
     "test:geometry": "esbuild src/geometry.ts --format=esm --outfile=.probe/geometry.mjs && node scripts/geometry-test.mjs",
-    "export-model": ".venv/Scripts/python scripts/export_model.py"
+    "export-model": ".venv/Scripts/python scripts/export_model.py",
+    "imagination-corpus": ".venv/Scripts/python scripts/imagination_corpus.py",
+    "imagination-train": ".venv/Scripts/python scripts/train_imagination.py",
+    "imagination-bridge": ".venv/Scripts/python scripts/bridge_preview.py",
+    "imagination-export": ".venv/Scripts/python scripts/export_imagination.py"
   },
   "dependencies": {
     "onnxruntime-web": "1.22.0-dev.20250409-89f8206ba4"

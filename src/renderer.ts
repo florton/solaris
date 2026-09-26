@@ -1,14 +1,37 @@
-// Sculptural renderer: WebGL2. The piece is a raymarched implicit surface —
-// token positions (interpolated between the two layers bracketing the focal
-// plane, put through the same 4D -> 3D transform as the picking projection)
-// become metaballs fused with a smooth-min into one glossy iridescent form
-// that morphs as the layer axis is scrubbed. Marched into an offscreen
-// target at adaptive resolution and composited with a chromatic fringe.
-// Hover picking stays on the CPU (projectVertices mirrors the transform).
+// Sculptural renderer: WebGL2. The piece has two bodies in one raymarcher:
+// the thought cloud (token positions fused into metaballs) and the
+// materialized form (per-layer SDF grids from the imagination decoder,
+// trilinearly sampled from 3D textures and lerped between the two layers
+// bracketing the focal plane). uMat crossfades cloud -> form: a thought
+// condenses. Lighting/iridescence/AO are field-agnostic, so both bodies share
+// the same gloss. Marched into an offscreen target at adaptive resolution and
+// composited with a chromatic fringe. Hover picking stays on the CPU
+// (projectVertices mirrors the transform).
 import type { Sculpture } from './sculpture.ts';
 
 const W_SPAN = 1.5;
 const MAX_BALLS = 64;
+
+// SDF grids upload as R16F: half floats are filterable in core WebGL2, so the
+// marcher gets hardware trilinear interpolation. Values are bounded (~±1.5).
+const _f32 = new Float32Array(1);
+const _u32 = new Uint32Array(_f32.buffer);
+function toHalf(v: number): number {
+  _f32[0] = v;
+  const x = _u32[0];
+  const sign = (x >> 16) & 0x8000;
+  let exp = ((x >> 23) & 0xff) - 127 + 15;
+  const man = x & 0x7fffff;
+  if (exp <= 0) return sign; // flush denormals; SDF values are never that small
+  if (exp >= 31) return sign | 0x7bff; // clamp to max half
+  return sign | (exp << 10) | ((man + 0x1000) >> 13);
+}
+
+function f32ToF16(v: Float32Array): Uint16Array {
+  const out = new Uint16Array(v.length);
+  for (let i = 0; i < v.length; i++) out[i] = toHalf(v[i]);
+  return out;
+}
 
 const VERT_FULLSCREEN = `#version 300 es
 void main() {
@@ -31,11 +54,25 @@ uniform highp sampler2D uBalls; // 64x2 RGBA32F: row 0 = xyz+radius, row 1 = rgb
 uniform int uCount;
 uniform float uSmin;
 uniform float uBound;
+uniform highp sampler3D uVol0; // SDF grid of the layer below the focal plane
+uniform highp sampler3D uVol1; // SDF grid of the layer above
+uniform float uVolFr;  // lerp between the two grids
+uniform float uVolBound; // world half-extent of the grids
+uniform float uMat;    // 0 = thought cloud, 1 = materialized form
 out vec4 outColor;
 
 float smin(float a, float b, float k) {
   float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
   return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+float formField(vec3 p) {
+  vec3 uvw = p / (2.0 * uVolBound) + 0.5;
+  float d = mix(texture(uVol0, uvw).r, texture(uVol1, uvw).r, uVolFr);
+  // intersect with the grid's own box so clamped-edge texels never leak
+  vec3 bq = abs(p) - vec3(uVolBound);
+  float boxD = length(max(bq, 0.0)) + min(max(bq.x, max(bq.y, bq.z)), 0.0);
+  return max(d, boxD);
 }
 
 float map(vec3 p) {
@@ -45,6 +82,10 @@ float map(vec3 p) {
     vec4 b = texelFetch(uBalls, ivec2(i, 0), 0);
     if (b.w <= 0.0) continue;
     d = smin(d, length(p - b.xyz) - b.w, uSmin);
+  }
+  if (uMat > 0.001) {
+    // the cloud shrinks as the form condenses out of it
+    d = mix(d * (1.0 + 0.35 * uMat), formField(p), uMat);
   }
   return d;
 }
@@ -184,6 +225,14 @@ export class Renderer {
   rotXW = 0;
   sigma = 1.15;
   persp4 = 3.2;
+  matTarget = 0; // 1 once the imagination has delivered its grids
+  private mat = 0;
+  private volumes: Float32Array[] = [];
+  private volGrid = 0;
+  private volBound = 1.35;
+  private texVol: [WebGLTexture, WebGLTexture];
+  private uploaded: [number, number] = [-1, -1];
+  private lastFrameT = 0;
   private targetDistance = 5.4;
   // per-frame body stats, recomputed in updateBalls: robust framing (median),
   // exact bounding-sphere radius (frameMax), fusion tracker (spreadK)
@@ -211,8 +260,28 @@ export class Renderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, MAX_BALLS, 2, 0, gl.RGBA, gl.FLOAT, null);
     gl.bindTexture(gl.TEXTURE_2D, null);
+    // dummy 1^3 SDF grids from the start: the raymarch shader always samples
+    // uVol0/uVol1, and an unbound (or type-conflicting) sampler3D invalidates
+    // every draw call — they are reallocated at the real grid size on first use
+    this.texVol = this.makeVolTextures(1);
     gl.disable(gl.DEPTH_TEST);
     this.resize();
+  }
+
+  private makeVolTextures(grid: number): [WebGLTexture, WebGLTexture] {
+    const gl = this.gl;
+    const pair: [WebGLTexture, WebGLTexture] = [gl.createTexture()!, gl.createTexture()!];
+    for (const t of pair) {
+      gl.bindTexture(gl.TEXTURE_3D, t);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+      gl.texImage3D(gl.TEXTURE_3D, 0, gl.R16F, grid, grid, grid, 0, gl.RED, gl.HALF_FLOAT, null);
+    }
+    gl.bindTexture(gl.TEXTURE_3D, null);
+    return pair;
   }
 
   resize(): void {
@@ -257,6 +326,60 @@ export class Renderer {
         .sort((a, b) => sal[b] - sal[a] || a - b)
         .slice(0, MAX_BALLS),
     );
+  }
+
+  /** Which two layers bracket the focal plane right now, and the lerp. */
+  private focusBracket(): { l0: number; l1: number; fr: number } {
+    const L = this.sculpture!.nLayers;
+    const fw = Math.max(-W_SPAN, Math.min(W_SPAN, this.focus));
+    const t = L <= 1 ? 0 : (fw / W_SPAN + 1) * 0.5 * (L - 1);
+    const l0 = Math.min(L - 1, Math.floor(t));
+    return { l0, l1: Math.min(L - 1, l0 + 1), fr: Math.min(1, Math.max(0, t - l0)) };
+  }
+
+  /** Prepare the volume store for a new thought's imagination grids. */
+  initVolumes(nLayers: number, grid: number, bound: number): void {
+    this.volumes = new Array(nLayers).fill(null);
+    this.volBound = bound;
+    if (grid !== this.volGrid) {
+      for (const t of this.texVol) this.gl.deleteTexture(t);
+      this.volGrid = grid;
+      this.texVol = this.makeVolTextures(grid);
+    }
+    this.uploaded = [-1, -1];
+  }
+
+  setLayerVolume(layer: number, sdf: Float32Array): void {
+    if (layer < this.volumes.length) this.volumes[layer] = sdf;
+  }
+
+  resetVolumes(): void {
+    this.volumes = [];
+    this.matTarget = 0;
+    this.mat = 0;
+    this.uploaded = [-1, -1];
+  }
+
+  get volCount(): number {
+    let n = 0;
+    for (const v of this.volumes) if (v) n++;
+    return n;
+  }
+
+  /** Upload the bracketing layers' grids to the two 3D textures (only on a
+   *  bracket change — scrubbing the layer axis does not re-upload). */
+  private uploadVolumes(l0: number, l1: number): void {
+    if (!this.volumes[l0] || !this.volumes[l1]) return;
+    if (this.uploaded[0] === l0 && this.uploaded[1] === l1) return;
+    const gl = this.gl;
+    const pair: Array<[number, number]> = [[0, l0], [1, l1]];
+    for (const [slot, layer] of pair) {
+      if (this.uploaded[slot] === layer) continue;
+      gl.bindTexture(gl.TEXTURE_3D, this.texVol[slot]);
+      gl.texSubImage3D(gl.TEXTURE_3D, 0, 0, 0, 0, this.volGrid, this.volGrid, this.volGrid, gl.RED, gl.HALF_FLOAT, f32ToF16(this.volumes[layer]));
+    }
+    gl.bindTexture(gl.TEXTURE_3D, null);
+    this.uploaded = [l0, l1];
   }
 
   private camera(): { eye: [number, number, number]; right: number[]; up: number[]; fwd: number[] } {
@@ -322,13 +445,8 @@ export class Renderer {
   private updateBalls(): void {
     const s = this.sculpture;
     if (!s) return;
-    const L = s.nLayers;
     const n = s.nTokens;
-    const fw = Math.max(-W_SPAN, Math.min(W_SPAN, this.focus));
-    const t = L <= 1 ? 0 : (fw / W_SPAN + 1) * 0.5 * (L - 1);
-    const l0 = Math.min(L - 1, Math.floor(t));
-    const l1 = Math.min(L - 1, l0 + 1);
-    const fr = Math.min(1, Math.max(0, t - l0));
+    const { l0, l1, fr } = this.focusBracket();
     const cs = Math.cos(this.rotXW);
     const sn = Math.sin(this.rotXW);
     const d = this.ballData;
@@ -401,11 +519,22 @@ export class Renderer {
       gl.clear(gl.COLOR_BUFFER_BIT);
       return;
     }
+    // condensation ramp: when the imagination's grids arrive (matTarget=1),
+    // the cloud folds into the materialized form over ~2.5 s
+    const now = performance.now();
+    const dt = this.lastFrameT ? Math.min(0.1, (now - this.lastFrameT) / 1000) : 0.016;
+    this.lastFrameT = now;
+    this.mat += (this.matTarget - this.mat) * (1 - Math.exp(-dt / 0.7));
+    if (this.mat < 1e-4 && this.matTarget === 0) this.mat = 0;
+
+    const { l0, l1, fr } = this.focusBracket();
+    if (this.texVol && this.volumes.length) this.uploadVolumes(l0, l1);
     this.updateBalls();
-    // robust framing: follow the median ball distance so outlier tokens
-    // can't push the body out of frame and the form fills the view on
-    // compressed and dispersed layers alike
-    this.targetDistance = Math.min(10, Math.max(4, this.frameMedian * 3.4));
+    // robust framing: follow the median ball distance for the cloud, the grid
+    // bound for the form — blended with the condensation
+    const cloudDist = Math.min(10, Math.max(4, this.frameMedian * 3.4));
+    const formDist = Math.min(10, Math.max(3.2, this.volBound * 2.7));
+    this.targetDistance = cloudDist + (formDist - cloudDist) * this.mat;
     this.distance += (this.targetDistance - this.distance) * 0.05;
     const aspect = this.canvas.width / Math.max(1, this.canvas.height);
     const cam = this.camera();
@@ -424,10 +553,20 @@ export class Renderer {
     gl.uniform1f(ru('uAspect'), aspect);
     gl.uniform1i(ru('uCount'), Math.min(this.ballSel.length, MAX_BALLS));
     gl.uniform1f(ru('uSmin'), 0.38 * this.spreadK);
-    gl.uniform1f(ru('uBound'), this.frameMax + 0.3);
+    gl.uniform1f(ru('uBound'), this.frameMax + 0.3 + (this.volBound * 1.15 - this.frameMax - 0.3) * this.mat);
+    gl.uniform1f(ru('uVolFr'), fr);
+    gl.uniform1f(ru('uVolBound'), this.volBound);
+    gl.uniform1f(ru('uMat'), this.uploaded[0] >= 0 ? this.mat : 0);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.ballTex);
     gl.uniform1i(ru('uBalls'), 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_3D, this.texVol[0]);
+    gl.uniform1i(ru('uVol0'), 1);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_3D, this.texVol[1]);
+    gl.uniform1i(ru('uVol1'), 2);
+    gl.activeTexture(gl.TEXTURE0);
     gl.bindVertexArray(this.emptyVAO);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 

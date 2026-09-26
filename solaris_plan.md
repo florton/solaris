@@ -1,6 +1,6 @@
 # Solaris — build plan
 
-*Working title. Compiled 2026-09-17. Status: pre-build, plan only.*
+*Working title. Compiled 2026-09-17. Status: built through Phase 4; Phase 5 (materialization) added 2026-09-23.*
 
 A standalone 4D artwork powered by an on-device transformer. The visitor types a thought, dream, or memory; a small language model reads it locally and the geometry of what the model "holds together" becomes a holographic sculpture. Same thought, same sculpture, forever. No API calls, no server — the model runs on the visitor's own GPU.
 
@@ -106,3 +106,16 @@ Tech: TypeScript + Vite (house stack), WebGPU or WebGL2 — this is points + lin
 4. **Token cap.** Long thoughts truncate at ~128 tokens; the input UI should make the limit feel intentional (a *thought*, not an essay) rather than arbitrary.
 5. **Similarity-matrix geometry can be boring** for some inputs (uniform blob). Consider per-layer centering/normalization, threshold tuning, or a force-directed overlay pass — but only after seeing real output; don't pre-solve.
 6. **Weight download size.** ~25 MB first load is acceptable; say so honestly in the UI ("one-time download, runs on your GPU thereafter").
+
+---
+
+## Phase 5 — Materialization (added post-launch)
+
+The cloud was alive but had no *form*. The fix is a second, tiny network: the encoder thinks, **the imagination dreams**. A DeepSDF-class auto-decoder (latent 32, Fourier features, MLP 5×160, fp32, ~500 KB) is trained offline on a procedurally generated corpus of forms (seeded SDF grammar: smin-fused primitives, domain deformations, symmetry folds, gentle displacement — infinite, download-free). At runtime, each layer's salience-free mean-pooled embedding is mapped through a deterministic seeded bridge onto the decoder's continuous latent manifold, one code per layer; the worker evaluates each code on an SDF grid (64³ WebGPU / 40³ wasm) and the renderer raymarches the grid pair bracketing the focal plane. The metaball cloud appears first, then **condenses** into the materialized form (`uMat` crossfade in the shared raymarcher); scrubbing the layer axis re-dreams the form level by level.
+
+Design notes:
+
+- **Emergent, not a repertoire.** Forms live on a continuous learned manifold; the bridge is smooth, so near-duplicate thoughts morph and distant thoughts diverge. Nothing is canned.
+- **Determinism preserved.** The bridge is pure code (mulberry32-seeded matrices, mirrored bit-for-bit in `scripts/bridge_preview.py`); the decoder ships frozen fp32 weights.
+- **Graceful degradation.** If `models/imagination/` is absent or fails to load, the piece silently remains the thought cloud — no broken page.
+- **Pipeline** (gated, re-runnable): `imagination_corpus.py` (Gate 1: corpus previews) → `train_imagination.py` (Gate 2: probe + interpolation strips; unclamped Huber loss — a clamped loss lets far-field magnitudes drift and the marcher overshoots) → `bridge_preview.py` (Gate 3: real thoughts → rendered forms, spread calibration) → `export_imagination.py` (ONNX fp32, verified vs torch). npm scripts: `imagination-corpus`, `imagination-train`, `imagination-bridge`, `imagination-export`.

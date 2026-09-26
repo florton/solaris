@@ -1,7 +1,9 @@
 // Model runtime (main-thread side): tokenizes, delegates inference to
 // worker.ts. Backend ladder: webgpu -> wasm, with a watchdog that survives
 // even a synchronously-blocked GPU backend (the worker gets terminated).
+// Also owns the bridge: pooled per-layer embeddings -> imagination latents.
 import { WordPieceTokenizer } from './tokenizer.ts';
+import { Bridge, poolEmbedding, type BridgeSpec } from './bridge.ts';
 
 export interface ModelMeta {
   id: string;
@@ -12,9 +14,15 @@ export interface ModelMeta {
   outputs: string[];
 }
 
+export interface ImaginationMeta extends BridgeSpec {
+  bound: number;
+  grid: { webgpu: number; wasm: number };
+}
+
 export interface ForwardResult {
   tokens: string[]; // display words (wordpiece fragments merged), specials removed
   hiddenStates: Float32Array[]; // per layer: [nTokens * hiddenDim], specials removed
+  pooled: Float32Array[]; // per layer: unit-norm mean-pooled embedding [hiddenDim]
   nLayers: number;
   hiddenDim: number;
   forwardMs: number;
@@ -34,7 +42,14 @@ function startWatchdog(ms: number, onTimeout: () => void): () => void {
   };
 }
 
-function spawnAndLoad(modelUrl: string, ortBase: string, backend: string, onStatus: (m: string) => void): Promise<{ worker: Worker; workerUrl: string }> {
+function spawnAndLoad(
+  modelUrl: string,
+  ortBase: string,
+  backend: string,
+  onStatus: (m: string) => void,
+  imaginationUrl: string | null,
+  latentDim: number,
+): Promise<{ worker: Worker; workerUrl: string }> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
     let settled = false;
@@ -66,12 +81,19 @@ function spawnAndLoad(modelUrl: string, ortBase: string, backend: string, onStat
       worker.terminate();
       reject(new Error(e.message ?? 'worker error'));
     };
-    worker.postMessage({ type: 'load', modelUrl, ortBase, backend });
+    worker.postMessage({ type: 'load', modelUrl, ortBase, backend, imaginationUrl, latentDim });
   });
 }
 
 export class SolarisModel {
   private callbacks = new Map<number, (r: { forwardMs: number; dims: number; layers: Float32Array[] }) => void>();
+  private matCallbacks = new Map<number, {
+    onLayer: (layer: number, sdf: Float32Array, grid: number) => void;
+    onDone: (ms: number, grid: number) => void;
+  }>();
+  private matCounter = 0;
+  public bridge: Bridge | null = null;
+  public imagination: ImaginationMeta | null = null;
 
   private constructor(
     public meta: ModelMeta,
@@ -89,6 +111,15 @@ export class SolarisModel {
           this.callbacks.delete(0);
           cb(m);
         }
+      } else if (m.type === 'form-layer' || m.type === 'materialize-done' || m.type === 'materialize-unavailable') {
+        const cb = this.matCallbacks.get(m.reqId);
+        if (!cb) return; // stale request
+        if (m.type === 'form-layer') cb.onLayer(m.layer, m.sdf, m.grid);
+        else {
+          this.matCallbacks.delete(m.reqId);
+          if (m.type === 'materialize-done') cb.onDone(m.ms, m.grid);
+          else cb.onDone(NaN, 0);
+        }
       }
     };
   }
@@ -102,7 +133,18 @@ export class SolarisModel {
     onStatus('loading vocabulary…');
     const tokenizer = await WordPieceTokenizer.load(`${modelBase}vocab.txt`);
 
+    // the imagination is optional: no card, no forms, no error
+    let imagination: ImaginationMeta | null = null;
+    const imaginationBase = new URL('models/imagination/', root).href;
+    try {
+      const r = await fetch(`${imaginationBase}imagination_model.json`);
+      if (r.ok) imagination = (await r.json()) as ImaginationMeta;
+    } catch {
+      imagination = null;
+    }
+
     const modelUrl = `${modelBase}onnx/model_quantized.onnx`;
+    const imaginationUrl = imagination ? `${imaginationBase}decoder.onnx` : null;
     const ortBase = new URL('ort/', root).href;
     const forced = new URLSearchParams(location.search).get('backend');
     // hidden tab: no one is watching and GPU shader compile can block for
@@ -115,7 +157,7 @@ export class SolarisModel {
     if (wantGpu) {
       try {
         onStatus('warming up webgpu…');
-        spawned = await spawnAndLoad(modelUrl, ortBase, 'webgpu', onStatus);
+        spawned = await spawnAndLoad(modelUrl, ortBase, 'webgpu', onStatus, imaginationUrl, imagination?.latentDim ?? 24);
       } catch {
         onStatus('webgpu unavailable — falling back to wasm…');
       }
@@ -123,9 +165,14 @@ export class SolarisModel {
     if (!spawned) {
       backend = 'wasm';
       onStatus('warming up wasm…');
-      spawned = await spawnAndLoad(modelUrl, ortBase, 'wasm', onStatus);
+      spawned = await spawnAndLoad(modelUrl, ortBase, 'wasm', onStatus, imaginationUrl, imagination?.latentDim ?? 24);
     }
-    return new SolarisModel(meta, tokenizer, spawned.worker, backend, performance.now() - t0, spawned.workerUrl);
+    const m = new SolarisModel(meta, tokenizer, spawned.worker, backend, performance.now() - t0, spawned.workerUrl);
+    if (imagination) {
+      m.imagination = imagination;
+      m.bridge = new Bridge(imagination);
+    }
+    return m;
   }
 
   async forward(text: string): Promise<ForwardResult> {
@@ -145,12 +192,35 @@ export class SolarisModel {
       else word = t;
       words.push(word);
     }
+    const n = keep.length;
     return {
       tokens: words,
       hiddenStates: result.layers,
+      pooled: result.layers.map((h) => poolEmbedding(h, n, result.dims)),
       nLayers: result.layers.length,
       hiddenDim: result.dims,
       forwardMs: result.forwardMs,
     };
+  }
+
+  /** Dream the thought into per-layer SDF grids. Null when the piece has no
+   *  imagination (decoder absent) — the caller just stays a cloud. */
+  materialize(
+    result: ForwardResult,
+    onLayer: (layer: number, sdf: Float32Array, grid: number) => void,
+  ): Promise<{ ms: number; grid: number } | null> | null {
+    if (!this.bridge || !this.imagination) return null;
+    const latents = this.bridge.mapLayers(result.pooled);
+    const reqId = ++this.matCounter;
+    const grid = this.backend === 'webgpu' ? this.imagination.grid.webgpu : this.imagination.grid.wasm;
+    return new Promise((resolve) => {
+      this.matCallbacks.set(reqId, {
+        onLayer,
+        onDone: (ms, g) => resolve(Number.isNaN(ms) ? null : { ms, grid: g }),
+      });
+      this.worker.postMessage(
+        { type: 'materialize', reqId, latents: latents.buffer.slice(0), grid, bound: this.imagination!.bound },
+      );
+    });
   }
 }
