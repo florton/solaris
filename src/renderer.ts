@@ -12,27 +12,6 @@ import type { Sculpture } from './sculpture.ts';
 const W_SPAN = 1.5;
 const MAX_BALLS = 64;
 
-// SDF grids upload as R16F: half floats are filterable in core WebGL2, so the
-// marcher gets hardware trilinear interpolation. Values are bounded (~±1.5).
-const _f32 = new Float32Array(1);
-const _u32 = new Uint32Array(_f32.buffer);
-function toHalf(v: number): number {
-  _f32[0] = v;
-  const x = _u32[0];
-  const sign = (x >> 16) & 0x8000;
-  let exp = ((x >> 23) & 0xff) - 127 + 15;
-  const man = x & 0x7fffff;
-  if (exp <= 0) return sign; // flush denormals; SDF values are never that small
-  if (exp >= 31) return sign | 0x7bff; // clamp to max half
-  return sign | (exp << 10) | ((man + 0x1000) >> 13);
-}
-
-function f32ToF16(v: Float32Array): Uint16Array {
-  const out = new Uint16Array(v.length);
-  for (let i = 0; i < v.length; i++) out[i] = toHalf(v[i]);
-  return out;
-}
-
 const VERT_FULLSCREEN = `#version 300 es
 void main() {
   vec2 v = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
@@ -76,6 +55,9 @@ float formField(vec3 p) {
 }
 
 float map(vec3 p) {
+  // fully condensed: the cloud contributes nothing, so skip its 64-ball loop
+  // (map runs ~6x per march step with normals + AO)
+  if (uMat > 0.999) return formField(p);
   float d = 1e9;
   for (int i = 0; i < ${MAX_BALLS}; i++) {
     if (i >= uCount) break;
@@ -91,6 +73,17 @@ float map(vec3 p) {
 }
 
 vec3 bodyColor(vec3 p) {
+  // weights relative to the nearest ball: same blend as plain exp(-dd²·2.5),
+  // but a form surface far from every ball still gets the nearest colors
+  // instead of underflowing to black
+  float dmin2 = 1e9;
+  for (int i = 0; i < ${MAX_BALLS}; i++) {
+    if (i >= uCount) break;
+    vec4 b = texelFetch(uBalls, ivec2(i, 0), 0);
+    if (b.w <= 0.0) continue;
+    float dd = length(p - b.xyz) / max(b.w, 1e-3);
+    dmin2 = min(dmin2, dd * dd);
+  }
   vec3 c = vec3(0.0);
   float wsum = 0.0;
   for (int i = 0; i < ${MAX_BALLS}; i++) {
@@ -98,7 +91,7 @@ vec3 bodyColor(vec3 p) {
     vec4 b = texelFetch(uBalls, ivec2(i, 0), 0);
     if (b.w <= 0.0) continue;
     float dd = length(p - b.xyz) / max(b.w, 1e-3);
-    float w = exp(-dd * dd * 2.5);
+    float w = exp(-(dd * dd - dmin2) * 2.5);
     c += texelFetch(uBalls, ivec2(i, 1), 0).rgb * w;
     wsum += w;
   }
@@ -130,14 +123,16 @@ void main() {
     float t1 = -b + sq;
     float dmin = 1e9;
     bool hit = false;
-    for (int s = 0; s < 64 && t < t1; s++) {
+    // the form (thin parts, grazing rays) needs the long march; the smooth cloud does not
+    int maxSteps = uMat > 0.001 ? 160 : 64;
+    for (int s = 0; s < maxSteps && t < t1; s++) {
       float d = map(ro + rd * t);
       dmin = min(dmin, d);
       if (d < 0.002) {
         hit = true;
         break;
       }
-      t += d * 0.95;
+      t += max(d * 0.95, 0.0015); // never stall on a grazing ray
     }
     if (hit) {
       vec3 p = ro + rd * t;
@@ -157,7 +152,9 @@ void main() {
       hdr = base * (0.07 + dif * ao) + base * fres * 0.8 + irid * fres * 0.35 + vec3(1.0) * spec;
     } else {
       // proximity aura around the form
-      hdr = vec3(0.32, 0.28, 0.44) * exp(-dmin * dmin * 2.5) * 0.2;
+      // (tighter for the form: its truncated SDF never exceeds ~0.2, which
+      // would otherwise paint the whole bounding sphere as a flat disc)
+      hdr = vec3(0.32, 0.28, 0.44) * exp(-dmin * dmin * mix(2.5, 150.0, uMat)) * 0.2;
     }
   }
   outColor = vec4(bg + 1.0 - exp(-hdr * 1.6), 1.0);
@@ -227,11 +224,13 @@ export class Renderer {
   persp4 = 3.2;
   matTarget = 0; // 1 once the imagination has delivered its grids
   private mat = 0;
-  private volumes: Float32Array[] = [];
+  // one R16F texture per layer, uploaded once when its grid arrives, so
+  // scrubbing the layer axis only rebinds
+  private layerTex: WebGLTexture[] = [];
+  private layerReady: boolean[] = [];
   private volGrid = 0;
   private volBound = 1.35;
-  private texVol: [WebGLTexture, WebGLTexture];
-  private uploaded: [number, number] = [-1, -1];
+  private dummyVol: WebGLTexture;
   private lastFrameT = 0;
   private targetDistance = 5.4;
   // per-frame body stats, recomputed in updateBalls: robust framing (median),
@@ -260,28 +259,26 @@ export class Renderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, MAX_BALLS, 2, 0, gl.RGBA, gl.FLOAT, null);
     gl.bindTexture(gl.TEXTURE_2D, null);
-    // dummy 1^3 SDF grids from the start: the raymarch shader always samples
+    // dummy 1^3 SDF grid from the start: the raymarch shader always samples
     // uVol0/uVol1, and an unbound (or type-conflicting) sampler3D invalidates
-    // every draw call — they are reallocated at the real grid size on first use
-    this.texVol = this.makeVolTextures(1);
+    // every draw call
+    this.dummyVol = this.makeVolTexture(1);
     gl.disable(gl.DEPTH_TEST);
     this.resize();
   }
 
-  private makeVolTextures(grid: number): [WebGLTexture, WebGLTexture] {
+  private makeVolTexture(grid: number): WebGLTexture {
     const gl = this.gl;
-    const pair: [WebGLTexture, WebGLTexture] = [gl.createTexture()!, gl.createTexture()!];
-    for (const t of pair) {
-      gl.bindTexture(gl.TEXTURE_3D, t);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
-      gl.texImage3D(gl.TEXTURE_3D, 0, gl.R16F, grid, grid, grid, 0, gl.RED, gl.HALF_FLOAT, null);
-    }
+    const t = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_3D, t);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R16F, grid, grid, grid, 0, gl.RED, gl.HALF_FLOAT, null);
     gl.bindTexture(gl.TEXTURE_3D, null);
-    return pair;
+    return t;
   }
 
   resize(): void {
@@ -337,49 +334,38 @@ export class Renderer {
     return { l0, l1: Math.min(L - 1, l0 + 1), fr: Math.min(1, Math.max(0, t - l0)) };
   }
 
-  /** Prepare the volume store for a new thought's imagination grids. */
+  /** Prepare the per-layer textures for a new thought's grids (reused across
+   *  thoughts while the grid size stays the same). */
   initVolumes(nLayers: number, grid: number, bound: number): void {
-    this.volumes = new Array(nLayers).fill(null);
     this.volBound = bound;
     if (grid !== this.volGrid) {
-      for (const t of this.texVol) this.gl.deleteTexture(t);
+      for (const t of this.layerTex) this.gl.deleteTexture(t);
+      this.layerTex = [];
       this.volGrid = grid;
-      this.texVol = this.makeVolTextures(grid);
     }
-    this.uploaded = [-1, -1];
+    while (this.layerTex.length < nLayers) this.layerTex.push(this.makeVolTexture(grid));
+    this.layerReady = new Array(nLayers).fill(false);
   }
 
-  setLayerVolume(layer: number, sdf: Float32Array): void {
-    if (layer < this.volumes.length) this.volumes[layer] = sdf;
+  /** One layer's half-float grid (x fastest): uploaded right away, once. */
+  setLayerVolume(layer: number, vol: Uint16Array): void {
+    if (layer >= this.layerReady.length) return;
+    const gl = this.gl;
+    const g = this.volGrid;
+    gl.bindTexture(gl.TEXTURE_3D, this.layerTex[layer]);
+    gl.texSubImage3D(gl.TEXTURE_3D, 0, 0, 0, 0, g, g, g, gl.RED, gl.HALF_FLOAT, vol);
+    gl.bindTexture(gl.TEXTURE_3D, null);
+    this.layerReady[layer] = true;
   }
 
   resetVolumes(): void {
-    this.volumes = [];
+    this.layerReady = [];
     this.matTarget = 0;
     this.mat = 0;
-    this.uploaded = [-1, -1];
   }
 
   get volCount(): number {
-    let n = 0;
-    for (const v of this.volumes) if (v) n++;
-    return n;
-  }
-
-  /** Upload the bracketing layers' grids to the two 3D textures (only on a
-   *  bracket change — scrubbing the layer axis does not re-upload). */
-  private uploadVolumes(l0: number, l1: number): void {
-    if (!this.volumes[l0] || !this.volumes[l1]) return;
-    if (this.uploaded[0] === l0 && this.uploaded[1] === l1) return;
-    const gl = this.gl;
-    const pair: Array<[number, number]> = [[0, l0], [1, l1]];
-    for (const [slot, layer] of pair) {
-      if (this.uploaded[slot] === layer) continue;
-      gl.bindTexture(gl.TEXTURE_3D, this.texVol[slot]);
-      gl.texSubImage3D(gl.TEXTURE_3D, 0, 0, 0, 0, this.volGrid, this.volGrid, this.volGrid, gl.RED, gl.HALF_FLOAT, f32ToF16(this.volumes[layer]));
-    }
-    gl.bindTexture(gl.TEXTURE_3D, null);
-    this.uploaded = [l0, l1];
+    return this.layerReady.filter(Boolean).length;
   }
 
   private camera(): { eye: [number, number, number]; right: number[]; up: number[]; fwd: number[] } {
@@ -391,7 +377,7 @@ export class Renderer {
     ];
     const len = Math.hypot(eye[0], eye[1], eye[2]) || 1;
     const z = [eye[0] / len, eye[1] / len, eye[2] / len]; // backward
-    const x0 = [-z[2], 0, z[0]]; // cross((0,1,0), z)
+    const x0 = [z[2], 0, -z[0]]; // cross((0,1,0), z): world +y is screen up (dreamed forms stand upright)
     const xl = Math.hypot(x0[0], x0[1], x0[2]) || 1;
     const right = [x0[0] / xl, x0[1] / xl, x0[2] / xl];
     const up = [
@@ -528,7 +514,7 @@ export class Renderer {
     if (this.mat < 1e-4 && this.matTarget === 0) this.mat = 0;
 
     const { l0, l1, fr } = this.focusBracket();
-    if (this.texVol && this.volumes.length) this.uploadVolumes(l0, l1);
+    const formOk = !!(this.layerReady[l0] && this.layerReady[l1]);
     this.updateBalls();
     // robust framing: follow the median ball distance for the cloud, the grid
     // bound for the form — blended with the condensation
@@ -554,17 +540,20 @@ export class Renderer {
     gl.uniform1i(ru('uCount'), Math.min(this.ballSel.length, MAX_BALLS));
     gl.uniform1f(ru('uSmin'), 0.38 * this.spreadK);
     gl.uniform1f(ru('uBound'), this.frameMax + 0.3 + (this.volBound * 1.15 - this.frameMax - 0.3) * this.mat);
-    gl.uniform1f(ru('uVolFr'), fr);
+    // adjacent layers can dream unrelated forms, and a half-way SDF blend of two
+    // is a ghost of both: hold each form for most of the scrub, morph briefly
+    const frS = Math.min(1, Math.max(0, (fr - 0.3) / 0.4));
+    gl.uniform1f(ru('uVolFr'), frS * frS * (3 - 2 * frS));
     gl.uniform1f(ru('uVolBound'), this.volBound);
-    gl.uniform1f(ru('uMat'), this.uploaded[0] >= 0 ? this.mat : 0);
+    gl.uniform1f(ru('uMat'), formOk ? this.mat : 0);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.ballTex);
     gl.uniform1i(ru('uBalls'), 0);
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_3D, this.texVol[0]);
+    gl.bindTexture(gl.TEXTURE_3D, formOk ? this.layerTex[l0] : this.dummyVol);
     gl.uniform1i(ru('uVol0'), 1);
     gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_3D, this.texVol[1]);
+    gl.bindTexture(gl.TEXTURE_3D, formOk ? this.layerTex[l1] : this.dummyVol);
     gl.uniform1i(ru('uVol1'), 2);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindVertexArray(this.emptyVAO);

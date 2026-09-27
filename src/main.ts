@@ -1,22 +1,21 @@
 // Solaris — a thought goes in, a hologram of what the model holds together
-// comes out. Boot: load weights -> run -> render -> idle drift.
-import { SolarisModel } from './model.ts';
+// comes out. Boot: load weights -> tour the preset thoughts (each: cloud ->
+// dreamed forms -> condense -> hold) -> a typed thought takes over, and the
+// tour resumes once the viewer goes idle.
+import { SolarisModel, type ForwardResult } from './model.ts';
 import { buildSculpture, type Sculpture } from './sculpture.ts';
 import { Renderer } from './renderer.ts';
 import { UI, encodePermalink, decodePermalink } from './ui.ts';
+import { PRESETS, TOUR } from './presets.ts';
 
 const W_SPAN = 1.5;
 const canvas = document.getElementById('gl') as HTMLCanvasElement;
-const ui = new UI(runThought);
+const ui = new UI((text) => void runUserThought(text));
 
 let renderer: Renderer;
 let model: SolarisModel;
 let sculpture: Sculpture | null = null;
 let loadMs = 0;
-let lastForwardMs = 0;
-let lastEigenMs = 0;
-let lastFormMs: number | undefined;
-let lastFormGrid: number | undefined;
 
 // interaction state
 let dragging = false;
@@ -28,11 +27,63 @@ let focusTarget = 0;
 let lastInteract = 0;
 let fps = 60;
 
-async function runThought(text: string): Promise<void> {
+/** A thought, encoded, with its dream arriving layer by layer. */
+interface Prepared {
+  text: string;
+  result: ForwardResult;
+  layers: (Uint16Array | null)[]; // half-float grids from the dream worker
+  sources: string[]; // per layer: the library form it was dreamed from
+  dreamId: number | null; // while the dream is queued or running
+  dreamMs?: number; // set once every layer has arrived
+  failed?: string;
+}
+
+let current: Prepared | null = null;
+let shownAt = 0;
+let condensedAt = 0;
+
+/** Encode the thought and queue its dream (the dream worker runs them in order). */
+async function prepare(text: string): Promise<Prepared> {
+  const result = await model.forward(text);
+  const p: Prepared = { text, result, layers: new Array(result.nLayers).fill(null), sources: [], dreamId: null };
+  p.dreamId = model.requestDream(text, result, {
+    onLayer: (layer, vol, source) => {
+      p.layers[layer] = vol;
+      p.sources[layer] = source;
+      if (current === p) uploadLayer(p, layer);
+    },
+    onDone: (ms) => {
+      p.dreamMs = ms;
+      p.dreamId = null;
+    },
+    onFail: (message) => {
+      p.failed = message;
+      p.dreamId = null;
+      console.warn(`dream failed for "${text}":`, message);
+    },
+  });
+  return p;
+}
+
+function uploadLayer(p: Prepared, layer: number): void {
+  renderer.setLayerVolume(layer, p.layers[layer]!);
+}
+
+/** Condense once every layer is up and the cloud has had its moment. */
+function maybeCondense(now: number): void {
+  if (!current || renderer.matTarget !== 0 || renderer.volCount < current.layers.length) return;
+  if (now - shownAt < TOUR.cloudMs) return;
+  renderer.matTarget = 1;
+  condensedAt = now;
+}
+
+/** Put a prepared thought on stage; any layers already dreamed go up at once. */
+function show(p: Prepared, permalink: boolean): void {
+  current = p;
   ui.unpin();
   ui.hideLabel(true);
-  const result = await model.forward(text);
-  sculpture = buildSculpture(result);
+  ui.setInput(p.text);
+  sculpture = buildSculpture(p.result);
   renderer.resetVolumes();
   renderer.setSculpture(sculpture);
   // the sculpture *appears*: sweep up the layer axis from below the stack
@@ -40,29 +91,108 @@ async function runThought(text: string): Promise<void> {
   focusTarget = 0;
   renderer.render();
   ui.buildGauge(sculpture.nLayers);
-  lastForwardMs = result.forwardMs;
-  lastEigenMs = sculpture.eigenMs;
-  lastFormMs = undefined;
-  lastFormGrid = undefined;
-  history.replaceState(null, '', encodePermalink(text));
+  shownAt = performance.now();
+  condensedAt = 0;
+  if (model.dream) {
+    renderer.initVolumes(p.result.nLayers, model.dream.grid, model.dream.bound);
+    p.layers.forEach((v, l) => v && uploadLayer(p, l));
+  }
+  history.replaceState(null, '', permalink ? encodePermalink(p.text) : location.pathname + location.search);
   updateStats();
+}
 
-  // kick the imagination: pooled layer embeddings -> latents -> SDF grids,
-  // arriving per layer while the thought cloud holds the stage
-  const sc = sculpture;
-  const mat = model.materialize(result, (layer, sdf, grid) => {
-    if (sculpture !== sc) return; // superseded by a newer thought
-    if (renderer.volCount === 0) renderer.initVolumes(sc.nLayers, grid, model.imagination!.bound);
-    renderer.setLayerVolume(layer, sdf);
-    if (renderer.volCount === sc.nLayers) renderer.matTarget = 1; // condense
-  });
-  void mat?.then((r) => {
-    if (r && sculpture === sc) {
-      lastFormMs = r.ms;
-      lastFormGrid = r.grid;
-      updateStats();
+// --- the tour: preset thoughts, the next one dreamed while this one is on stage
+const tour = { on: true, index: -1, busy: false, resumeAfter: 0 };
+const tourCache = new Map<string, Promise<Prepared>>();
+
+function tourPrepare(i: number): Promise<Prepared> {
+  const text = PRESETS[((i % PRESETS.length) + PRESETS.length) % PRESETS.length];
+  let p = tourCache.get(text);
+  if (!p) {
+    p = prepare(text);
+    tourCache.set(text, p);
+  }
+  return p;
+}
+
+async function tourShow(i: number): Promise<void> {
+  if (tour.busy) return;
+  tour.busy = true;
+  try {
+    const p = await tourPrepare(i);
+    if (!tour.on) return; // someone typed a thought meanwhile
+    tour.index = i;
+    show(p, false);
+    void tourPrepare(i + 1);
+  } finally {
+    tour.busy = false;
+  }
+}
+
+/** Stop the tour and drop its unfinished dreams so the typed one runs next. */
+function pauseTour(): void {
+  tour.on = false;
+  tour.resumeAfter = performance.now() + TOUR.resumeMs;
+  for (const [text, pending] of tourCache) {
+    void pending.then((p) => {
+      if (p.dreamId !== null) {
+        model.cancelDream(p.dreamId);
+        tourCache.delete(text);
+      }
+    });
+  }
+}
+
+let userSeq = 0;
+let userPrepared: Prepared | null = null;
+async function runUserThought(text: string): Promise<void> {
+  pauseTour();
+  const seq = ++userSeq;
+  if (userPrepared && userPrepared.dreamId !== null) model.cancelDream(userPrepared.dreamId); // superseded
+  const p = await prepare(text);
+  if (seq !== userSeq) {
+    if (p.dreamId !== null) model.cancelDream(p.dreamId);
+    return;
+  }
+  userPrepared = p;
+  show(p, true);
+}
+
+function tourTick(): void {
+  if (!model) return;
+  const now = performance.now();
+  // state, not animation: runs here too so a paused rAF (hidden tab) can't stall it
+  maybeCondense(now);
+  ui.setDreamBanner(dreamState().banner ?? null);
+  if (tour.busy) return;
+  if (!tour.on) {
+    if (now > tour.resumeAfter && now - lastInteract > TOUR.resumeMs) {
+      tour.on = true;
+      void tourShow(tour.index + 1);
     }
-  });
+    return;
+  }
+  if (!current) return;
+  // hold from the moment it condenses; a thought that cannot dream holds as a cloud
+  const cannotDream = current.failed !== undefined || (current.dreamId === null && current.dreamMs === undefined);
+  const since = condensedAt || (cannotDream ? shownAt : 0);
+  if (since && now - since > TOUR.holdMs && now - lastInteract > TOUR.idleMs) void tourShow(tour.index + 1);
+}
+
+/** The imagination's state in words: a HUD line, and a banner while it matters. */
+function dreamState(): { hud?: string; banner?: string } {
+  const s = model.dreamStatus;
+  if (s.state === 'off') return {};
+  if (s.state === 'unavailable') return { hud: `imagination unavailable: ${s.message}`, banner: 'the imagination could not wake — cloud only' };
+  if (s.state === 'loading') {
+    const pct = s.total ? Math.round((100 * s.loaded) / s.total) : 0;
+    return { hud: `imagination loading ${pct}% of ${(s.total / 1e6).toFixed(0)} MB`, banner: `the imagination is waking… ${pct}%` };
+  }
+  if (!current) return {};
+  if (current.failed !== undefined) return { hud: `dream failed: ${current.failed}`, banner: 'this dream failed — cloud only' };
+  const n = current.layers.filter(Boolean).length;
+  if (current.dreamMs === undefined) return { hud: `imagination dreaming ${n}/${current.layers.length}`, banner: `dreaming… ${n}/${current.layers.length}` };
+  return { hud: `imagination · form ${(current.dreamMs / 1000).toFixed(1)} s · ${model.dream!.grid}³ grid · wasm ×${s.threads}` };
 }
 
 function pickToken(x: number, y: number): { token: string; sx: number; sy: number } | null {
@@ -163,13 +293,14 @@ function updateStats(): void {
     dtype: model.meta.dtype,
     backend: model.backend,
     loadMs,
-    forwardMs: lastForwardMs,
-    eigenMs: lastEigenMs,
+    forwardMs: current?.result.forwardMs ?? 0,
+    eigenMs: sculpture.eigenMs,
     tokens: sculpture.nTokens,
     layers: sculpture.nLayers,
     fps: Math.round(fps),
-    formMs: lastFormMs,
-    formGrid: lastFormGrid,
+    imagination: dreamState().hud,
+    formSource: current?.sources[Math.round(Math.max(0, Math.min(1, (renderer.focus / W_SPAN + 1) / 2)) * (sculpture.nLayers - 1))],
+    tour: tour.on ? `tour ${(tour.index % PRESETS.length) + 1}/${PRESETS.length}` : 'tour paused — resumes when idle',
     offline: cacheReport || undefined,
   });
 }
@@ -182,6 +313,7 @@ function frame(now: number): void {
     focusTarget = Math.sin(now * 0.00011) * (W_SPAN + 0.2); // slow depth drift
     renderer.rotXW = Math.sin(now * 0.000043) * 0.3;
   }
+  maybeCondense(performance.now());
   renderer.focus += (focusTarget - renderer.focus) * 0.08;
   renderer.render();
   ui.setGauge((renderer.focus / W_SPAN + 1) / 2);
@@ -189,6 +321,7 @@ function frame(now: number): void {
   if (lastFrame) fps = fps * 0.95 + 0.05 * (1000 / Math.max(1, now - lastFrame));
   lastFrame = now;
   updateStats();
+  ui.setDreamBanner(dreamState().banner ?? null);
   requestAnimationFrame(frame);
 }
 
@@ -213,12 +346,14 @@ async function boot(): Promise<void> {
   ui.hideStatus();
   wireInteraction();
 
-  const shared = decodePermalink(location.hash);
-  if (shared) {
-    ui.setInput(shared);
-    await runThought(shared);
-  }
+  // typing counts as interaction: the tour never advances under someone's cursor
+  document.getElementById('thought-input')!.addEventListener('input', () => (lastInteract = performance.now()));
+  setInterval(tourTick, 500);
   requestAnimationFrame(frame);
+  // a shared link shows its thought first; the tour picks up once idle
+  const shared = decodePermalink(location.hash);
+  if (shared) await runUserThought(shared);
+  else await tourShow(0);
 }
 
 if (import.meta.env.PROD && 'serviceWorker' in navigator) {
@@ -240,8 +375,12 @@ async function cacheEverything(): Promise<string> {
       'models/minilm-l6/solaris_model.json',
       'models/minilm-l6/vocab.txt',
       'models/minilm-l6/onnx/model_quantized.onnx',
-      'models/imagination/imagination_model.json',
-      'models/imagination/decoder.onnx',
+      'models/dream/dream_model.json',
+      'models/dream/prior.onnx',
+      'models/dream/decoder.onnx',
+      'models/dream/library_lat.bin',
+      'models/dream/library_emb.bin',
+      'models/dream/captions.json',
       'ort/ort-wasm-simd-threaded.jsep.wasm',
       'ort/ort-wasm-simd-threaded.jsep.mjs',
       'ort/ort-wasm-simd-threaded.wasm',

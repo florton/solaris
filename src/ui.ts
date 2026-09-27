@@ -12,8 +12,9 @@ export interface Stats {
   tokens: number;
   layers: number;
   fps: number;
-  formMs?: number;
-  formGrid?: number;
+  imagination?: string; // the dreamer's state in words
+  formSource?: string; // library form the focal layer was dreamed from
+  tour?: string;
   offline?: string;
 }
 
@@ -25,6 +26,8 @@ export class UI {
   private label = document.getElementById('token-label')!;
   private about = document.getElementById('about')!;
   private input = document.getElementById('thought-input') as HTMLInputElement;
+  private banner = document.getElementById('dream-banner')!;
+  private bannerText: string | null = null;
   private gaugeDots: HTMLElement[] = [];
   private labelPinned = false;
 
@@ -59,7 +62,9 @@ export class UI {
       `${s.modelName} · ${(s.params / 1e6).toFixed(1)}M params · ${s.dtype} · ${s.backend}\n` +
       `load ${m(s.loadMs)} · fwd ${m(s.forwardMs)} · eigen ${m(s.eigenMs)} · ` +
       `${s.tokens} tokens × ${s.layers} layers · ${s.fps} fps` +
-      (s.formMs !== undefined && s.formGrid ? `\nimagination · form ${m(s.formMs)} · ${s.formGrid}³ grid` : '') +
+      (s.imagination ? `\n${s.imagination}` : '') +
+      (s.formSource ? `\ndreamt from: ${s.formSource}` : '') +
+      (s.tour ? `\n${s.tour}` : '') +
       (s.offline ? `\n${s.offline}` : '');
   }
 
@@ -113,7 +118,17 @@ export class UI {
   }
 
   setInput(text: string): void {
+    if (document.activeElement === this.input) return; // never overwrite someone mid-typing
     this.input.value = text;
+  }
+
+  /** The imagination's state above the input while it matters (loading,
+   *  dreaming, failed); null hides it. */
+  setDreamBanner(text: string | null): void {
+    if (text === this.bannerText) return;
+    this.bannerText = text;
+    if (text) this.banner.textContent = text;
+    this.banner.classList.toggle('visible', !!text);
   }
 }
 

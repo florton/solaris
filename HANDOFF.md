@@ -130,12 +130,127 @@ v1), still creeping down by 0.0001–0.0003 per probe at the end. Big step up ov
 - Fit IoU (same 48+48 items as v1): train 0.156 / held-out 0.166 (v1 0.121 / 0.163; random 0.075 / 0.106).
   Layers 0/3/6 score about the same, so mixing layers isn't obviously what hurts.
 Diagnostic: scratchpad `prior_v2_diag.py` → `v2_guidance.png` (12 prompts × g 1,2,3,5,8).
+Backed up as `data/mimoid_prior_v2*.pt`, previews in `previews/mimoid_prior_v2/`.
+
+Data balance is not the issue (caption keywords: animals 15.6%, buildings 17.4%, heads 14.0%,
+cars 11.2%; 64 caption clusters range 42–784). Train loss ≈ held-out loss → underfit.
+
+## Tonight's run (2026-09-26): prior v3 = v2 resumed onto a 16 h schedule
+LR restarts at ~half peak (frac 0.5 of the cosine) and decays over 8 more hours. Resume tested.
+```
+cd C:\Users\17207\something\solaris; $env:PYTHONIOENCODING="utf-8"; .\.venv\Scripts\python.exe -u scripts\mimoid_train_prior.py --hours 16 --resume *> data\mimoid\prior_v3.log
+```
+Compare held-out v-loss with v2's 0.4652, and rerun `prior_v2_diag.py` (fit IoU + guidance sweep).
+
+## Prior v3 results (checked 2026-09-26) — `data/mimoid_prior.pt` = `data/mimoid_prior_v3*.pt`
+16 h total, 42,328 steps. Held-out v-loss 0.4652 → **0.4580**. It improved steadily until the LR
+decayed, then went flat for the last ~1 h. Fit IoU (same items/seeds): train 0.179 / held-out 0.178
+at L6 (v2 0.156 / 0.166); L3 and L0 are about the same. The guidance sweep (same noise as v2) looks
+almost identical to v2: the horse is a little more legged, the castle tower a little worse,
+mountain/lighthouse/house are still slabs. The layer walk ("a statue of a woman's face") has more
+holes at layers 1, 2 and 6 than v2's; the other layers are about the same. **More of the same training has hit diminishing returns.**
+Previews + diagnostics in `previews/mimoid_prior_v3/`.
+
+Nearest-caption retrieval (`nn_forms.png`: top-8 training forms per weak prompt):
+- **Model failures** (the data has clean forms, the prior averages them): horse (140 captions,
+  crisp horses), small house (gabled houses), lighthouse (tall towers), castle tower.
+- **Data-faithful**: "mountain" training forms are mostly flat terrain tiles, so the slab is what
+  the data says; "sleeping dog" forms are dogs lying on blankets. "stone face"/"stone hand" have
+  no real matches.
+
+Retrieval + SDEdit with v3 (`sdedit_v3.png`: top-1 retrieved form, then t0 0.3/0.45/0.6/0.75 × 2
+seeds, g 3) **now works**, unlike v1: horse, house, lighthouse, head, car and castle stay clean
+up to t0 ≈ 0.45 with small variations in pose and detail. At 0.6 and above, holes start to appear.
+Top-1 retrieval can pick the wrong kind of form ("a stone pillar" → a wall slab), so sample
+among top-k.
+Scripts (session scratchpad ad056f25…): `prior_v3_diag.py`, `nn_forms.py`, `sdedit_v3.py`.
+
+## Dreaming = retrieval + SDEdit (2026-09-26) — `scripts/mimoid_dream.py`
+Chosen generation path. For each layer l of a thought: take the cosine between the pooled
+embedding and every caption embedding of layer l, then pick one of the top k=8 with weight
+exp((sim − best)/temp), temp 0.05. Noise that form's live latent to t0 0.4 and denoise it
+with the v3 prior (16 DDIM steps, CFG g 3, conditioned on the thought + layer tag).
+Deterministic and browser-portable: seed = FNV-1a(UTF-8 text); one mulberry32 stream (same as
+`src/bridge.ts`, checked bit-exact against node) gives 7 pick uniforms, then 1,536 uniforms →
+Box-Muller → one noise field shared by all layers. `Dreamer` class = the reference the browser
+port must match.
+Previews in `previews/mimoid_dream/`: `prompts.png` (L6, 5 seed variants), `thoughts.png`
+(abstract thoughts × layers 0..6); `*_temp02.png` = temp 0.02, where exact-caption matches
+won every seed.
+- Every concrete prompt now gives a recognizable, clean form (horse, heads, cars, pillars,
+  lighthouses, houses, castle towers). Seed variants give real variety wherever several
+  captions score close together.
+- Abstract thoughts make layer stories: "a whale drifting through fog" goes whale → iceberg →
+  sardine → airplane in clouds → whale. The shallow layers (L0–L2) match on words, the deep
+  ones on meaning.
+- A prompt with one exact caption match ("a horse") gives the same form on all 7 layers.
+- Weak spots come from the library: flat terrain tiles, multi-object scenes ("small house with
+  windmill and pumpkins") and holey thin forms get retrieved as-is.
+Browser cost: the live latents of all 18,597 forms are about 29 MB int8, plus the caption
+embeddings (7 × 384 per form, about 50 MB int8 for all layers; layer 6 only is about 7 MB),
+plus the prior (8.3M params, about 17 MB fp16).
+
+## In the browser (2026-09-26) — `npm run dev`, http://localhost:5173
+- `scripts/export_dream.py` → `public/models/dream/` (about 120 MB, untracked):
+  - `decoder.onnx` (6.9 MB): the dead channels + de-normalization are a fixed 1×1×1 conv in
+    front; the output is world-unit SDF, x-fastest (texImage3D order).
+  - `prior.onnx` (33 MB): one guided call, CFG batch inside the graph.
+  - int8 library files `library_lat.bin` (29 MB) and `library_emb.bin` (50 MB), plus
+    `captions.json` and `dream_model.json`.
+  - No Resize and nothing above 6-D in either graph. Both are checked against torch (≤ 2e-5).
+- `src/dream.ts` (retrieval, seed stream, schedule) + `src/worker.ts` `dream()`: one layer at a
+  time, each posted as it finishes, and a newer thought supersedes the one in progress. The stats line
+  shows "dreamt from: <caption>" for the focal layer. The old Bridge class is gone (`bridge.ts`
+  keeps `mulberry32` + `poolEmbedding`); `models/imagination/` is no longer read.
+- The dreamer always runs on **wasm, 4 threads** (`crossOriginIsolated`; it was 1 thread). ORT's
+  WebGPU Conv3D took ~60 s for one layer. Timing in the in-app browser: 1 thread / 16 steps 52–68 s →
+  4 threads 25.6 s → 4 threads / 8 steps **9.2 s** per thought. 8 steps look the same as 16 (and 4)
+  (scratchpad `steps_cmp.py`).
+- The encoder on WebGPU (`?backend=webgpu`) retrieved "3mm dolly" for "a horse" (wasm: "a horse").
+  Check whether the q8 encoder's WebGPU hidden states differ from wasm.
+- Renderer fixes: the camera was rolled 180° (right = −x, up = −y), which never mattered for the
+  cloud, but it put forms upside down; fixed in `camera()` (picking shares it). Also:
+  - Body colour weights are now relative to the nearest ball (a form far from the cloud
+    was near-black).
+  - The aura is tightened as the form condenses (the truncated SDF painted a disc).
+  - The march now has 160 steps + a minimum step.
+  - The layer crossfade is sharpened: two unrelated forms blended half-way looked like
+    a ghost of both.
+- Python replay of the browser algorithm with the ONNX files: scratchpad `onnx_dream.py`.
+
+## Tour + reliability retool (2026-09-26, later)
+- **Silent fallback, cause 1:** ORT-web's wasm module allows one `session.run` at a time across
+  *all* its sessions ("Session already started"). Encoder and dreamer shared a worker, so a
+  thought typed mid-dream crashed the dream, and the piece stayed a cloud with nothing on
+  screen. The dreamer now has its own worker (`src/dream-worker.ts`, FIFO queue, cancellable).
+  Encoder runs are serialized in `worker.ts`, and forward requests have ids (they were all keyed 0).
+- **Cause 2:** wasm `run()` computes synchronously and resolves through microtasks, so the dream
+  loop never yielded, and cancel/queue messages were only seen after a whole dream (~10 s). It now
+  yields to the event loop (`setTimeout 0`) before every step; a cancel lands in ~5 ms.
+- **Tour** (`src/presets.ts`: 12 thoughts picked from scratchpad `preset_candidates.py`, plus
+  timings):
+  - Starts on load. The cloud shows ≥ 3 s, the thought condenses, holds 22 s, and never advances
+    while someone interacts.
+  - The next preset is encoded and dreamed while the current one is on stage.
+  - A typed thought pauses the tour, cancels its unfinished dreams and permalinks itself; the tour
+    resumes after 60 s idle. A shared `#t=` link plays first.
+- **Visible state:** a banner above the input ("the imagination is waking… n%", "dreaming… n/7",
+  "failed — cloud only"), and the HUD shows the same plus "tour n/12". Condensing and the banner
+  run on a 500 ms tick, not rAF.
+- **Renderer perf:**
+  - One R16F texture per layer, uploaded once on arrival. The worker sends half floats, so there
+    is no main-thread f32→f16 on scrub.
+  - `map()` skips the 64-ball cloud loop once fully condensed.
+  - The long 160-step march only runs while a form is visible (the cloud keeps 64).
+  - `half.ts` also fixes a mantissa-carry bug in the old toHalf.
+- Measured in the in-app browser (wasm ×4): about 10–12 s per dream, about 1.6 s per layer.
+- The in-app browser pane doesn't run rAF while hidden, so the condensation looks stuck there;
+  that's not an app bug.
 
 ## Next steps
-1. Read `overnight.log`; check build fail reasons; `preview` the full library.
-2. Eyeball `previews/mimoid_train/val_recon_*.png` vs `val_truth.png` and `interp_*.png`.
-3. Write stage 2 (caption embeddings via MiniLM, same pooling as the app; diffusion prior).
-4. ONNX export: replace `F.interpolate`/7-D permutes with ≤6-D per-axis reshapes
-   for ORT WebGPU; verify vs torch. ORT build has `Conv3DNaive` on WebGPU.
-5. Browser: replace bridge.ts/imagination path in worker/model/renderer (renderer's
-   R16F 3D texture volume path can be reused).
+1. The about text (`index.html`) still describes the old 57k-param procedural imagination
+   ("no canned shapes", "no two thoughts share a form"). It needs rewriting for retrieval + dreaming,
+   with Objaverse (CC-BY/CC-BY-SA/CC0) and Cap3D (ODC-By) credit.
+2. Deploy size: shrink `library_emb.bin` (PCA or a curated subset), prior to fp16.
+3. Layer variety: when one exact caption match wins, all 7 layers dream the same form.
+4. Down-weight junk library forms (flat terrain tiles, multi-object scenes, holey thin forms).

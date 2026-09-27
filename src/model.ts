@@ -1,9 +1,11 @@
 // Model runtime (main-thread side): tokenizes, delegates inference to
 // worker.ts. Backend ladder: webgpu -> wasm, with a watchdog that survives
 // even a synchronously-blocked GPU backend (the worker gets terminated).
-// Also owns the bridge: pooled per-layer embeddings -> imagination latents.
+// Also starts the dreamer in its own worker (dream-worker.ts): pooled
+// per-layer embeddings -> forms.
 import { WordPieceTokenizer } from './tokenizer.ts';
-import { Bridge, poolEmbedding, type BridgeSpec } from './bridge.ts';
+import { poolEmbedding } from './bridge.ts';
+import { fnv1a, type DreamMeta } from './dream.ts';
 
 export interface ModelMeta {
   id: string;
@@ -14,11 +16,6 @@ export interface ModelMeta {
   outputs: string[];
 }
 
-export interface ImaginationMeta extends BridgeSpec {
-  bound: number;
-  grid: { webgpu: number; wasm: number };
-}
-
 export interface ForwardResult {
   tokens: string[]; // display words (wordpiece fragments merged), specials removed
   hiddenStates: Float32Array[]; // per layer: [nTokens * hiddenDim], specials removed
@@ -26,6 +23,18 @@ export interface ForwardResult {
   nLayers: number;
   hiddenDim: number;
   forwardMs: number;
+}
+
+export type DreamStatus =
+  | { state: 'off' } // no dream_model.json: the piece stays a cloud
+  | { state: 'loading'; loaded: number; total: number }
+  | { state: 'ready'; threads: number }
+  | { state: 'unavailable'; message: string };
+
+export interface DreamHandlers {
+  onLayer: (layer: number, vol: Uint16Array, source: string) => void; // half-float grid, x fastest
+  onDone: (ms: number) => void;
+  onFail: (message: string) => void;
 }
 
 const GPU_TIMEOUT_MS = 15000;
@@ -47,8 +56,6 @@ function spawnAndLoad(
   ortBase: string,
   backend: string,
   onStatus: (m: string) => void,
-  imaginationUrl: string | null,
-  latentDim: number,
 ): Promise<{ worker: Worker; workerUrl: string }> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
@@ -81,19 +88,19 @@ function spawnAndLoad(
       worker.terminate();
       reject(new Error(e.message ?? 'worker error'));
     };
-    worker.postMessage({ type: 'load', modelUrl, ortBase, backend, imaginationUrl, latentDim });
+    worker.postMessage({ type: 'load', modelUrl, ortBase, backend });
   });
 }
 
 export class SolarisModel {
-  private callbacks = new Map<number, (r: { forwardMs: number; dims: number; layers: Float32Array[] }) => void>();
-  private matCallbacks = new Map<number, {
-    onLayer: (layer: number, sdf: Float32Array, grid: number) => void;
-    onDone: (ms: number, grid: number) => void;
-  }>();
-  private matCounter = 0;
-  public bridge: Bridge | null = null;
-  public imagination: ImaginationMeta | null = null;
+  private forwards = new Map<number, { resolve: (r: { forwardMs: number; dims: number; layers: Float32Array[] }) => void; reject: (e: Error) => void }>();
+  private forwardCounter = 0;
+  private dreams = new Map<number, DreamHandlers>();
+  private dreamCounter = 0;
+  private dreamWorker: Worker | null = null;
+  public dream: DreamMeta | null = null;
+  public dreamStatus: DreamStatus = { state: 'off' };
+  public onDreamStatus: (s: DreamStatus) => void = () => {};
 
   private constructor(
     public meta: ModelMeta,
@@ -105,22 +112,11 @@ export class SolarisModel {
   ) {
     this.worker.onmessage = (e) => {
       const m = e.data;
-      if (m.type === 'result') {
-        const cb = this.callbacks.get(0);
-        if (cb) {
-          this.callbacks.delete(0);
-          cb(m);
-        }
-      } else if (m.type === 'form-layer' || m.type === 'materialize-done' || m.type === 'materialize-unavailable') {
-        const cb = this.matCallbacks.get(m.reqId);
-        if (!cb) return; // stale request
-        if (m.type === 'form-layer') cb.onLayer(m.layer, m.sdf, m.grid);
-        else {
-          this.matCallbacks.delete(m.reqId);
-          if (m.type === 'materialize-done') cb.onDone(m.ms, m.grid);
-          else cb.onDone(NaN, 0);
-        }
-      }
+      const pending = this.forwards.get(m.reqId);
+      if (!pending) return;
+      this.forwards.delete(m.reqId);
+      if (m.type === 'result') pending.resolve(m);
+      else if (m.type === 'forward-failed') pending.reject(new Error(m.message));
     };
   }
 
@@ -133,18 +129,7 @@ export class SolarisModel {
     onStatus('loading vocabulary…');
     const tokenizer = await WordPieceTokenizer.load(`${modelBase}vocab.txt`);
 
-    // the imagination is optional: no card, no forms, no error
-    let imagination: ImaginationMeta | null = null;
-    const imaginationBase = new URL('models/imagination/', root).href;
-    try {
-      const r = await fetch(`${imaginationBase}imagination_model.json`);
-      if (r.ok) imagination = (await r.json()) as ImaginationMeta;
-    } catch {
-      imagination = null;
-    }
-
     const modelUrl = `${modelBase}onnx/model_quantized.onnx`;
-    const imaginationUrl = imagination ? `${imaginationBase}decoder.onnx` : null;
     const ortBase = new URL('ort/', root).href;
     const forced = new URLSearchParams(location.search).get('backend');
     // hidden tab: no one is watching and GPU shader compile can block for
@@ -157,7 +142,7 @@ export class SolarisModel {
     if (wantGpu) {
       try {
         onStatus('warming up webgpu…');
-        spawned = await spawnAndLoad(modelUrl, ortBase, 'webgpu', onStatus, imaginationUrl, imagination?.latentDim ?? 24);
+        spawned = await spawnAndLoad(modelUrl, ortBase, 'webgpu', onStatus);
       } catch {
         onStatus('webgpu unavailable — falling back to wasm…');
       }
@@ -165,23 +150,59 @@ export class SolarisModel {
     if (!spawned) {
       backend = 'wasm';
       onStatus('warming up wasm…');
-      spawned = await spawnAndLoad(modelUrl, ortBase, 'wasm', onStatus, imaginationUrl, imagination?.latentDim ?? 24);
+      spawned = await spawnAndLoad(modelUrl, ortBase, 'wasm', onStatus);
     }
     const m = new SolarisModel(meta, tokenizer, spawned.worker, backend, performance.now() - t0, spawned.workerUrl);
-    if (imagination) {
-      m.imagination = imagination;
-      m.bridge = new Bridge(imagination);
-    }
+    // the imagination is optional: no card, no forms, no error. It loads after
+    // the encoder so the first thought's cloud is never waiting on it.
+    void m.startDreamer(new URL('models/dream/', root).href, ortBase);
     return m;
+  }
+
+  private setDreamStatus(s: DreamStatus): void {
+    this.dreamStatus = s;
+    this.onDreamStatus(s);
+  }
+
+  private async startDreamer(base: string, ortBase: string): Promise<void> {
+    try {
+      const r = await fetch(`${base}dream_model.json`);
+      if (!r.ok) return;
+      this.dream = (await r.json()) as DreamMeta;
+    } catch {
+      return;
+    }
+    this.setDreamStatus({ state: 'loading', loaded: 0, total: 0 });
+    const w = new Worker(new URL('./dream-worker.ts', import.meta.url), { type: 'module' });
+    this.dreamWorker = w;
+    w.onerror = (e) => this.setDreamStatus({ state: 'unavailable', message: e.message ?? 'dream worker error' });
+    w.onmessage = (e) => {
+      const m = e.data;
+      if (m.type === 'progress') this.setDreamStatus({ state: 'loading', loaded: m.loaded, total: m.total });
+      else if (m.type === 'ready') this.setDreamStatus({ state: 'ready', threads: m.threads });
+      else if (m.type === 'unavailable') this.setDreamStatus({ state: 'unavailable', message: m.message });
+      else {
+        const h = this.dreams.get(m.reqId);
+        if (!h) return; // cancelled
+        if (m.type === 'layer') h.onLayer(m.layer, m.vol, m.source);
+        else {
+          this.dreams.delete(m.reqId);
+          if (m.type === 'done') h.onDone(m.ms);
+          else if (m.type === 'failed') h.onFail(m.message);
+        }
+      }
+    };
+    w.postMessage({ type: 'load', base, meta: this.dream, ortBase });
   }
 
   async forward(text: string): Promise<ForwardResult> {
     const { tokens, ids } = this.tokenizer.encode(text, 128);
     const keep: number[] = [];
     for (let i = 0; i < ids.length; i++) if (!/^\[.*\]$/.test(tokens[i])) keep.push(i);
-    const result = await new Promise<{ forwardMs: number; dims: number; layers: Float32Array[] }>((resolve) => {
-      this.callbacks.set(0, resolve);
-      this.worker.postMessage({ type: 'forward', ids, keep, outputs: this.meta.outputs });
+    const reqId = ++this.forwardCounter;
+    const result = await new Promise<{ forwardMs: number; dims: number; layers: Float32Array[] }>((resolve, reject) => {
+      this.forwards.set(reqId, { resolve, reject });
+      this.worker.postMessage({ type: 'forward', reqId, ids, keep, outputs: this.meta.outputs });
     });
     // merge wordpiece fragments into words for display: 'card','##amo','##mon' -> 'cardamom'
     const kept = keep.map((i) => tokens[i]);
@@ -203,24 +224,21 @@ export class SolarisModel {
     };
   }
 
-  /** Dream the thought into per-layer SDF grids. Null when the piece has no
-   *  imagination (decoder absent) — the caller just stays a cloud. */
-  materialize(
-    result: ForwardResult,
-    onLayer: (layer: number, sdf: Float32Array, grid: number) => void,
-  ): Promise<{ ms: number; grid: number } | null> | null {
-    if (!this.bridge || !this.imagination) return null;
-    const latents = this.bridge.mapLayers(result.pooled);
-    const reqId = ++this.matCounter;
-    const grid = this.backend === 'webgpu' ? this.imagination.grid.webgpu : this.imagination.grid.wasm;
-    return new Promise((resolve) => {
-      this.matCallbacks.set(reqId, {
-        onLayer,
-        onDone: (ms, g) => resolve(Number.isNaN(ms) ? null : { ms, grid: g }),
-      });
-      this.worker.postMessage(
-        { type: 'materialize', reqId, latents: latents.buffer.slice(0), grid, bound: this.imagination!.bound },
-      );
-    });
+  /** Queue a dream of the thought (the worker runs them in order and holds
+   *  them until it has loaded). Returns an id for cancelDream, or null when
+   *  the piece has no imagination. */
+  requestDream(text: string, result: ForwardResult, handlers: DreamHandlers): number | null {
+    if (!this.dreamWorker || this.dreamStatus.state === 'unavailable') return null;
+    const reqId = ++this.dreamCounter;
+    const pooled = new Float32Array(result.nLayers * result.hiddenDim);
+    result.pooled.forEach((e, l) => pooled.set(e, l * result.hiddenDim));
+    this.dreams.set(reqId, handlers);
+    this.dreamWorker.postMessage({ type: 'dream', reqId, pooled: pooled.buffer, seed: fnv1a(text) }, [pooled.buffer]);
+    return reqId;
+  }
+
+  cancelDream(reqId: number): void {
+    if (!this.dreams.delete(reqId)) return;
+    this.dreamWorker?.postMessage({ type: 'cancel', reqId });
   }
 }

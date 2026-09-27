@@ -4,7 +4,7 @@
 // - everything else (hashed js/css, model weights, wasm): cache-first,
 //   then network + cache-fill. Weights are frozen with the build; bump CACHE
 //   when they change and old caches are purged on activate.
-const CACHE = 'solaris-v3'; // bump: added models/imagination/
+const CACHE = 'solaris-v4'; // bump: models/imagination/ -> models/dream/
 
 self.addEventListener('install', (event) => {
   event.waitUntil(self.skipWaiting());
