@@ -28,12 +28,12 @@ export interface ForwardResult {
 export type DreamStatus =
   | { state: 'off' } // no dream_model.json: the piece stays a cloud
   | { state: 'loading'; loaded: number; total: number }
-  | { state: 'ready'; threads: number }
+  | { state: 'ready'; threads: number; library: boolean } // library: the full latents file is in
   | { state: 'unavailable'; message: string };
 
 export interface DreamHandlers {
-  onLayer: (layer: number, vol: Uint16Array, source: string) => void; // half-float grid, x fastest
-  onDone: (ms: number) => void;
+  onLayer: (layer: number, vol: Uint16Array, source: string, index: number) => void; // half-float full SDF, x fastest; index: library form
+  onDone: (ms: number, melts: number[]) => void; // melts[l]: inflation of the layer l -> l+1 morph
   onFail: (message: string) => void;
 }
 
@@ -92,12 +92,77 @@ function spawnAndLoad(
   });
 }
 
+/** The dream worker, restartable. ORT-web's wasm thread pool can hang for
+ *  good while creating a session (seen in the in-app browser: 1 thread ready
+ *  in 0.5 s, 2+ threads never). Threads make the decoder ~3× faster, so they
+ *  are tried first; if the worker isn't ready 4 s after its download, it is
+ *  replaced by a single-threaded one and everything sent meanwhile is replayed. */
+class DreamHost {
+  private worker!: Worker;
+  private ready = false;
+  private early: unknown[] = []; // messages before adopt()
+  private sink: ((m: any) => void) | null = null;
+  private held: { msg: unknown; transfer: Transferable[] }[] = []; // sent before 'ready'
+
+  constructor(
+    public meta: DreamMeta,
+    private base: string,
+    private ortBase: string,
+  ) {
+    this.spawn(self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1);
+  }
+
+  private deliver(m: unknown): void {
+    if (this.sink) this.sink(m);
+    else this.early.push(m);
+  }
+
+  private spawn(threads: number): void {
+    const w = new Worker(new URL('./dream-worker.ts', import.meta.url), { type: 'module' });
+    this.worker = w;
+    let cancelWatchdog: (() => void) | null = null;
+    w.onmessage = (e) => {
+      if (w !== this.worker) return;
+      const m = e.data;
+      if (m.type === 'ready') {
+        this.ready = true;
+        cancelWatchdog?.();
+        for (const h of this.held) w.postMessage(h.msg, h.transfer);
+        this.held = [];
+      }
+      if (threads > 1 && !cancelWatchdog && m.type === 'progress' && m.stage === 'core' && m.total && m.loaded >= m.total) {
+        cancelWatchdog = startWatchdog(4000, () => {
+          if (this.ready || w !== this.worker) return;
+          console.warn(`dreamer: ${threads}-thread wasm session never came up; retrying on 1 thread`);
+          w.terminate();
+          this.spawn(1);
+        });
+      }
+      this.deliver(m);
+    };
+    w.onerror = (e) => this.deliver({ type: 'unavailable', message: e.message ?? 'dream worker error' });
+    w.postMessage({ type: 'load', base: this.base, meta: this.meta, ortBase: this.ortBase, threads });
+  }
+
+  adopt(sink: (m: any) => void): void {
+    this.sink = sink;
+    for (const m of this.early) sink(m);
+    this.early = [];
+  }
+
+  /** Dreams and cancels: held until the worker is ready, so a respawn loses nothing. */
+  postMessage(msg: unknown, transfer: Transferable[] = []): void {
+    if (this.ready) this.worker.postMessage(msg, transfer);
+    else this.held.push({ msg, transfer });
+  }
+}
+
 export class SolarisModel {
   private forwards = new Map<number, { resolve: (r: { forwardMs: number; dims: number; layers: Float32Array[] }) => void; reject: (e: Error) => void }>();
   private forwardCounter = 0;
   private dreams = new Map<number, DreamHandlers>();
   private dreamCounter = 0;
-  private dreamWorker: Worker | null = null;
+  private dreamWorker: DreamHost | null = null;
   public dream: DreamMeta | null = null;
   public dreamStatus: DreamStatus = { state: 'off' };
   public onDreamStatus: (s: DreamStatus) => void = () => {};
@@ -131,10 +196,15 @@ export class SolarisModel {
 
     const modelUrl = `${modelBase}onnx/model_quantized.onnx`;
     const ortBase = new URL('ort/', root).href;
+    // the imagination is optional (no card: no forms, no error) and downloads
+    // alongside the encoder rather than after it
+    const dreamer = SolarisModel.startDreamer(new URL('models/dream/', root).href, ortBase);
     const forced = new URLSearchParams(location.search).get('backend');
-    // hidden tab: no one is watching and GPU shader compile can block for
-    // minutes under timer throttling — go straight to wasm
-    const wantGpu = forced ? forced === 'webgpu' : !document.hidden && typeof navigator !== 'undefined' && 'gpu' in navigator;
+    // wasm unless asked: ORT-web's WebGPU kernels for this q8 graph return
+    // hidden states unrelated to the real ones (cosine ~0 vs wasm/PyTorch on
+    // every layer), so both the cloud and the dream retrieval were noise.
+    // The encoder is small; wasm runs a thought in well under 100 ms.
+    const wantGpu = forced === 'webgpu';
 
     let spawned: { worker: Worker; workerUrl: string } | null = null;
     let backend = 'webgpu';
@@ -153,9 +223,7 @@ export class SolarisModel {
       spawned = await spawnAndLoad(modelUrl, ortBase, 'wasm', onStatus);
     }
     const m = new SolarisModel(meta, tokenizer, spawned.worker, backend, performance.now() - t0, spawned.workerUrl);
-    // the imagination is optional: no card, no forms, no error. It loads after
-    // the encoder so the first thought's cloud is never waiting on it.
-    void m.startDreamer(new URL('models/dream/', root).href, ortBase);
+    m.adoptDreamer(await dreamer);
     return m;
   }
 
@@ -164,35 +232,39 @@ export class SolarisModel {
     this.onDreamStatus(s);
   }
 
-  private async startDreamer(base: string, ortBase: string): Promise<void> {
+  private static async startDreamer(base: string, ortBase: string): Promise<DreamHost | null> {
     try {
       const r = await fetch(`${base}dream_model.json`);
-      if (!r.ok) return;
-      this.dream = (await r.json()) as DreamMeta;
+      if (!r.ok) return null;
+      return new DreamHost((await r.json()) as DreamMeta, base, ortBase);
     } catch {
-      return;
+      return null;
     }
+  }
+
+  private adoptDreamer(d: DreamHost | null): void {
+    if (!d) return;
+    this.dream = d.meta;
+    this.dreamWorker = d;
     this.setDreamStatus({ state: 'loading', loaded: 0, total: 0 });
-    const w = new Worker(new URL('./dream-worker.ts', import.meta.url), { type: 'module' });
-    this.dreamWorker = w;
-    w.onerror = (e) => this.setDreamStatus({ state: 'unavailable', message: e.message ?? 'dream worker error' });
-    w.onmessage = (e) => {
-      const m = e.data;
-      if (m.type === 'progress') this.setDreamStatus({ state: 'loading', loaded: m.loaded, total: m.total });
-      else if (m.type === 'ready') this.setDreamStatus({ state: 'ready', threads: m.threads });
-      else if (m.type === 'unavailable') this.setDreamStatus({ state: 'unavailable', message: m.message });
+    d.adopt((m) => {
+      if (m.type === 'progress') {
+        if (m.stage === 'core') this.setDreamStatus({ state: 'loading', loaded: m.loaded, total: m.total });
+      } else if (m.type === 'ready') this.setDreamStatus({ state: 'ready', threads: m.threads, library: false });
+      else if (m.type === 'library') {
+        if (this.dreamStatus.state === 'ready') this.setDreamStatus({ ...this.dreamStatus, library: true });
+      } else if (m.type === 'unavailable') this.setDreamStatus({ state: 'unavailable', message: m.message });
       else {
         const h = this.dreams.get(m.reqId);
         if (!h) return; // cancelled
-        if (m.type === 'layer') h.onLayer(m.layer, m.vol, m.source);
+        if (m.type === 'layer') h.onLayer(m.layer, m.vol, m.source, m.index);
         else {
           this.dreams.delete(m.reqId);
-          if (m.type === 'done') h.onDone(m.ms);
+          if (m.type === 'done') h.onDone(m.ms, m.melts);
           else if (m.type === 'failed') h.onFail(m.message);
         }
       }
-    };
-    w.postMessage({ type: 'load', base, meta: this.dream, ortBase });
+    });
   }
 
   async forward(text: string): Promise<ForwardResult> {
@@ -230,10 +302,9 @@ export class SolarisModel {
   requestDream(text: string, result: ForwardResult, handlers: DreamHandlers): number | null {
     if (!this.dreamWorker || this.dreamStatus.state === 'unavailable') return null;
     const reqId = ++this.dreamCounter;
-    const pooled = new Float32Array(result.nLayers * result.hiddenDim);
-    result.pooled.forEach((e, l) => pooled.set(e, l * result.hiddenDim));
+    const query = result.pooled[this.dream!.embLayer].slice();
     this.dreams.set(reqId, handlers);
-    this.dreamWorker.postMessage({ type: 'dream', reqId, pooled: pooled.buffer, seed: fnv1a(text) }, [pooled.buffer]);
+    this.dreamWorker.postMessage({ type: 'dream', reqId, query: query.buffer, seed: fnv1a(text) }, [query.buffer]);
     return reqId;
   }
 

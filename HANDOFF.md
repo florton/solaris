@@ -1,4 +1,4 @@
-# Handoff — Solaris "mimoid" rebuild (2026-09-23)
+# Handoff — Solaris "mimoid" rebuild (2026-09-23, v0.02 retool 2026-09-26)
 
 ## Direction (decided with the user)
 The v1–v3 "imagination" (procedural SDF grammar → DeepSDF MLP → random-projection
@@ -247,10 +247,70 @@ plus the prior (8.3M params, about 17 MB fp16).
 - The in-app browser pane doesn't run rAF while hidden, so the condensation looks stuck there;
   that's not an app bug.
 
+## v0.02 retool (2026-09-26, after v0.01 feedback)
+User feedback on v0.01: slow, not user-first load; a few forms repeated on unrelated prompts
+("ants on a log" -> helicopter); broken forms ("a knife and an arrow"); the layer axis felt like
+a slideshow, not 4D.
+
+**Root cause of the repeats: the WebGPU encoder.** On WebGPU the q8 MiniLM's hidden states have
+cosine ~0 with wasm/PyTorch on *every* layer (wasm matches PyTorch to ~3 decimals). Chrome picked
+WebGPU, so retrieval (and the cloud) ran on noise. `model.ts` now always uses wasm for the encoder
+(`?backend=webgpu` still forces it). In Python, retrieval had no hubness (540+/600 unique top-1s on
+held-out Cap3D captions); scratchpad `retr_diag.py`.
+
+**Dreaming = retrieval + a 4D walk (SDEdit prior retired from the browser).**
+- `scripts/mimoid_quality.py` -> `data/mimoid_quality.npz`: per-form metrics on the AE reconstruction
+  (largest-part share, flatness, base-plate share, recon IoU vs truth, caption commas/"and", volume;
+  plus `shell`, which isn't used: open scans are thin shells yet render fine). Keeps 14,898 / 18,597.
+  `--sheet` -> `previews/mimoid_quality.png` (the forms just past each limit).
+- Retrieval reads only the sentence embedding (pooled layer 6). The top 24 are the thought's
+  neighbourhood; layers are drawn deepest-first without replacement, weighted by
+  exp((sim - best)/temp), with temp 0.02 at L6 and 0.08 at L0. Every layer is on topic and different:
+  deep layers are the closest match, shallow layers looser associations. The 7-layer embedding table
+  is gone (50 MB -> 5.7 MB).
+- SDEdit shredded thin forms (helicopter rotors) and cost 33 MB + ~10 s. The prior isn't shipped;
+  `Dreamer.sdedit` stays for diagnostics.
+- **Melt morphs**: each decoded SDF is extended to a full distance field (3-D EDT beyond the ±0.2
+  band, `fullSdf`). Between layers: lerp + half-way inflation (`meltAmount`: keep ≥ 1.1× the smaller
+  volume, clamped to [0.06, 0.25]; in practice 0.06 almost always). Truncated-SDF lerps vanish
+  half-way; the diffusion bridge (noise both to t, lerp, denoise) snaps and gets holey (scratchpad
+  `morph.py`/`morph2.py`/`morph3.py`).
+- Reference: `scripts/mimoid_dream.py` (`Walker`, `pick_forms`, `full_sdf`, `melt_amount`,
+  `body_at`) -> `previews/mimoid_dream/walk.png` (13 slices along w per thought). Browser picks match
+  on neighbourhood but not always per layer (q8 encoder + int8 index shift near-ties).
+- `export_dream.py`: decoder.onnx 6.9 MB, library_emb.bin 5.7 MB, captions.json 0.9 MB,
+  library_lat.bin 22.9 MB, credits.json 1.2 MB ([uid, name, author, license] per form; the readout
+  credits the focal form).
+
+**4D renderer.** All 7 full SDFs are in one R16F 3D texture (64×64×448). `formField` slices the 4D
+body with a hyperplane at w = focus, tilted into x by `rotXW` (q.x = x·cos, w = focus + x·sin), and
+melts between the bracketing layers (held near each layer, smoothstep 0.12–0.88). The step is
+scaled by 1/√(1+16 sin²) for the steeper tilted field, with 200 march steps. Controls: scroll = w,
+shift+drag / shift+scroll / `[` `]` = tilt (±0.7 rad), `0` = reset; idle drifts both.
+
+**Load, user first.** The dreamer downloads alongside the encoder, not after it. It's ready once
+decoder + index + captions (13.5 MB) are in, and the latents stream in behind (dreams Range-fetch
+their 7 rows until then). A thought typed during the load is queued and goes first; the tour only
+starts if nobody typed. The HUD moved top-left (5 lines ran under the input).
+- **ORT wasm threads can hang**: in the in-app browser, `InferenceSession.create` with numThreads ≥ 2
+  never resolved (1 thread: ready in 0.5 s). The committed v0.01 worker hung there too. `DreamHost` in
+  `model.ts` tries threads, and if the worker isn't ready 4 s after its download it respawns on
+  1 thread and replays held messages. One thread: decoder ~0.8 s/layer, EDT + melt ~50 ms ->
+  ~6.5 s per 7-form dream (v0.01: 10–12 s on 4 threads). Threads should give ~3×.
+- The in-app pane's screenshots were a zoomed crop of the top-left in the first tab. A red dot at
+  the page center confirmed the render is centered; a fresh tab captured normally.
+
+Tour presets re-picked for the walk: 14 (owl, church bell, sailing ship, dragon replace the sleeping
+giant and cathedral light). Scratchpad `presets_walk.py`.
+
 ## Next steps
-1. The about text (`index.html`) still describes the old 57k-param procedural imagination
-   ("no canned shapes", "no two thoughts share a form"). It needs rewriting for retrieval + dreaming,
-   with Objaverse (CC-BY/CC-BY-SA/CC0) and Cap3D (ODC-By) credit.
-2. Deploy size: shrink `library_emb.bin` (PCA or a curated subset), prior to fp16.
-3. Layer variety: when one exact caption match wins, all 7 layers dream the same form.
-4. Down-weight junk library forms (flat terrain tiles, multi-object scenes, holey thin forms).
+1. **Grow the library** (the real limit on "does the form relate to my prompt": no ants, guitars
+   or anchors exist). The AE doesn't need retraining: `mimoid_grid_ckpt.pt` has the encoder. Needs:
+   `select` with bigger quotas / new families (tools, instruments, insects, furniture), overnight
+   `build`, an encode-only script for new grids, then captions -> quality -> export. The browser cost
+   is 384 B/form for the index (latents stream / Range-fetch).
+2. Check whether wasm threads come up in real Chrome (they hung in the in-app browser); if they do,
+   dreams should drop to ~2–3 s.
+3. The melt midpoint between dissimilar poses is a fused lump by design; aligning forms (principal
+   axes / center of mass) before the lerp could make melts read as bodies turning into each other.
+4. Thin sheets (wings) show voxel stair-steps at 64³.

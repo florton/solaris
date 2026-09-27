@@ -14,6 +14,7 @@ export interface Stats {
   fps: number;
   imagination?: string; // the dreamer's state in words
   formSource?: string; // library form the focal layer was dreamed from
+  tilt?: number; // x-w tilt of the slicing hyperplane (radians)
   tour?: string;
   offline?: string;
 }
@@ -64,6 +65,7 @@ export class UI {
       `${s.tokens} tokens × ${s.layers} layers · ${s.fps} fps` +
       (s.imagination ? `\n${s.imagination}` : '') +
       (s.formSource ? `\ndreamt from: ${s.formSource}` : '') +
+      (s.formSource && s.tilt !== undefined ? ` · slice tilted ${Math.round((s.tilt * 180) / Math.PI)}° into w` : '') +
       (s.tour ? `\n${s.tour}` : '') +
       (s.offline ? `\n${s.offline}` : '');
   }

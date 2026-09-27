@@ -70,9 +70,11 @@ body {
 }
 
 #hud {
+  /* top-left: at the bottom its 5 lines ran under the thought input */
   position: fixed;
   left: 14px;
-  bottom: 12px;
+  top: 12px;
+  max-width: min(620px, calc(100vw - 80px));
   pointer-events: none;
   z-index: 4;
 }
@@ -217,6 +219,9 @@ body {
 }
 #about p {
   margin-bottom: 12px;
+}
+#about a {
+  color: var(--holo-dim);
 }
 #about em {
   color: var(--holo-dim);

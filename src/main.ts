@@ -24,6 +24,8 @@ let lastY = 0;
 let downX = 0;
 let downY = 0;
 let focusTarget = 0;
+let tiltTarget = 0; // x-w tilt of the slicing hyperplane (renderer.rotXW eases to it)
+const clampTilt = (a: number) => Math.max(-0.7, Math.min(0.7, a));
 let lastInteract = 0;
 let fps = 60;
 
@@ -31,8 +33,10 @@ let fps = 60;
 interface Prepared {
   text: string;
   result: ForwardResult;
-  layers: (Uint16Array | null)[]; // half-float grids from the dream worker
+  layers: (Uint16Array | null)[]; // half-float full SDFs from the dream worker
   sources: string[]; // per layer: the library form it was dreamed from
+  forms: number[]; // per layer: that form's library index (for its credit)
+  melts: number[]; // per neighbouring pair: the melt's half-way inflation
   dreamId: number | null; // while the dream is queued or running
   dreamMs?: number; // set once every layer has arrived
   failed?: string;
@@ -45,16 +49,19 @@ let condensedAt = 0;
 /** Encode the thought and queue its dream (the dream worker runs them in order). */
 async function prepare(text: string): Promise<Prepared> {
   const result = await model.forward(text);
-  const p: Prepared = { text, result, layers: new Array(result.nLayers).fill(null), sources: [], dreamId: null };
+  const p: Prepared = { text, result, layers: new Array(result.nLayers).fill(null), sources: [], forms: [], melts: [], dreamId: null };
   p.dreamId = model.requestDream(text, result, {
-    onLayer: (layer, vol, source) => {
+    onLayer: (layer, vol, source, index) => {
       p.layers[layer] = vol;
       p.sources[layer] = source;
+      p.forms[layer] = index;
       if (current === p) uploadLayer(p, layer);
     },
-    onDone: (ms) => {
+    onDone: (ms, melts) => {
       p.dreamMs = ms;
+      p.melts = melts;
       p.dreamId = null;
+      if (current === p) renderer.setMelts(melts);
     },
     onFail: (message) => {
       p.failed = message;
@@ -69,9 +76,11 @@ function uploadLayer(p: Prepared, layer: number): void {
   renderer.setLayerVolume(layer, p.layers[layer]!);
 }
 
-/** Condense once every layer is up and the cloud has had its moment. */
+/** Condense once the whole body is in (every layer and the melts between
+ *  them) and the cloud has had its moment. */
 function maybeCondense(now: number): void {
-  if (!current || renderer.matTarget !== 0 || renderer.volCount < current.layers.length) return;
+  if (!current || renderer.matTarget !== 0 || current.dreamMs === undefined) return;
+  if (renderer.volCount < current.layers.length) return;
   if (now - shownAt < TOUR.cloudMs) return;
   renderer.matTarget = 1;
   condensedAt = now;
@@ -96,6 +105,7 @@ function show(p: Prepared, permalink: boolean): void {
   if (model.dream) {
     renderer.initVolumes(p.result.nLayers, model.dream.grid, model.dream.bound);
     p.layers.forEach((v, l) => v && uploadLayer(p, l));
+    renderer.setMelts(p.melts);
   }
   history.replaceState(null, '', permalink ? encodePermalink(p.text) : location.pathname + location.search);
   updateStats();
@@ -145,9 +155,19 @@ function pauseTour(): void {
 
 let userSeq = 0;
 let userPrepared: Prepared | null = null;
+// a thought typed while the weights are still loading waits here instead of
+// being dropped (and keeps the tour from starting at all)
+let modelLoaded: () => void = () => {};
+const whenModel = new Promise<void>((r) => (modelLoaded = r));
+
 async function runUserThought(text: string): Promise<void> {
-  pauseTour();
+  tour.on = false;
+  tour.resumeAfter = performance.now() + TOUR.resumeMs;
   const seq = ++userSeq;
+  if (!model) ui.setStatus(`"${text.length > 40 ? text.slice(0, 40) + '…' : text}" is next, as soon as the model is in`);
+  await whenModel;
+  if (seq !== userSeq) return;
+  pauseTour();
   if (userPrepared && userPrepared.dreamId !== null) model.cancelDream(userPrepared.dreamId); // superseded
   const p = await prepare(text);
   if (seq !== userSeq) {
@@ -192,7 +212,11 @@ function dreamState(): { hud?: string; banner?: string } {
   if (current.failed !== undefined) return { hud: `dream failed: ${current.failed}`, banner: 'this dream failed — cloud only' };
   const n = current.layers.filter(Boolean).length;
   if (current.dreamMs === undefined) return { hud: `imagination dreaming ${n}/${current.layers.length}`, banner: `dreaming… ${n}/${current.layers.length}` };
-  return { hud: `imagination · form ${(current.dreamMs / 1000).toFixed(1)} s · ${model.dream!.grid}³ grid · wasm ×${s.threads}` };
+  return {
+    hud:
+      `imagination · 7 forms in ${(current.dreamMs / 1000).toFixed(1)} s · ${model.dream!.n.toLocaleString()} forms · ` +
+      `${model.dream!.grid}³ · wasm ×${s.threads}${s.library ? '' : ' · library streaming'}`,
+  };
 }
 
 function pickToken(x: number, y: number): { token: string; sx: number; sy: number } | null {
@@ -240,7 +264,12 @@ function wireInteraction(): void {
   });
   canvas.addEventListener('pointermove', (e) => {
     lastInteract = performance.now();
-    if (dragging) {
+    if (dragging && e.shiftKey) {
+      // shift-drag: tilt the slicing hyperplane into w
+      tiltTarget = clampTilt(tiltTarget + (e.clientX - lastX) * 0.004);
+      lastX = e.clientX;
+      lastY = e.clientY;
+    } else if (dragging) {
       renderer.yaw += (e.clientX - lastX) * 0.005;
       renderer.pitch = Math.max(-1.4, Math.min(1.4, renderer.pitch + (e.clientY - lastY) * 0.005));
       lastX = e.clientX;
@@ -272,7 +301,9 @@ function wireInteraction(): void {
   window.addEventListener(
     'wheel',
     (e) => {
-      focusTarget = Math.max(-W_SPAN - 0.4, Math.min(W_SPAN + 0.4, focusTarget + e.deltaY * 0.0016));
+      // (shift turns the wheel sideways in some browsers: deltaX)
+      if (e.shiftKey) tiltTarget = clampTilt(tiltTarget + (e.deltaY || e.deltaX) * 0.0012);
+      else focusTarget = Math.max(-W_SPAN - 0.4, Math.min(W_SPAN + 0.4, focusTarget + e.deltaY * 0.0016));
       lastInteract = performance.now();
     },
     { passive: true },
@@ -281,8 +312,25 @@ function wireInteraction(): void {
     if (e.target instanceof HTMLInputElement) return;
     if (e.key === 'ArrowDown' || e.key === 'ArrowRight') focusTarget = Math.min(W_SPAN + 0.4, focusTarget + 0.22);
     if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') focusTarget = Math.max(-W_SPAN - 0.4, focusTarget - 0.22);
+    if (e.key === '[') tiltTarget = clampTilt(tiltTarget - 0.1);
+    if (e.key === ']') tiltTarget = clampTilt(tiltTarget + 0.1);
+    if (e.key === '0') tiltTarget = 0;
     lastInteract = performance.now();
   });
+}
+
+// [uid, name, author, license] per library form; fetched after boot, only for the stats line
+let credits: string[][] | null = null;
+const LICENSES: Record<string, string> = { by: 'CC-BY', 'by-sa': 'CC-BY-SA', cc0: 'CC0' };
+
+/** The focal layer's form: what it is, and whose model it was. */
+function focalSource(): string | undefined {
+  if (!current || !sculpture) return undefined;
+  const l = Math.round(Math.max(0, Math.min(1, (renderer.focus / W_SPAN + 1) / 2)) * (sculpture.nLayers - 1));
+  const caption = current.sources[l];
+  if (caption === undefined) return undefined;
+  const c = credits?.[current.forms[l]];
+  return c ? `${caption} — “${c[1]}” by ${c[2]} (${LICENSES[c[3]] ?? c[3]})` : caption;
 }
 
 function updateStats(): void {
@@ -299,7 +347,8 @@ function updateStats(): void {
     layers: sculpture.nLayers,
     fps: Math.round(fps),
     imagination: dreamState().hud,
-    formSource: current?.sources[Math.round(Math.max(0, Math.min(1, (renderer.focus / W_SPAN + 1) / 2)) * (sculpture.nLayers - 1))],
+    formSource: focalSource(),
+    tilt: renderer.rotXW,
     tour: tour.on ? `tour ${(tour.index % PRESETS.length) + 1}/${PRESETS.length}` : 'tour paused — resumes when idle',
     offline: cacheReport || undefined,
   });
@@ -310,11 +359,12 @@ function frame(now: number): void {
   const idle = now - lastInteract > 3000;
   if (idle) {
     renderer.yaw += 0.00022; // glacial rotation
-    focusTarget = Math.sin(now * 0.00011) * (W_SPAN + 0.2); // slow depth drift
-    renderer.rotXW = Math.sin(now * 0.000043) * 0.3;
+    focusTarget = Math.sin(now * 0.00011) * (W_SPAN + 0.2); // slow drift along w
+    tiltTarget = Math.sin(now * 0.000043) * 0.4; // ...and the slice slowly tilting into it
   }
   maybeCondense(performance.now());
   renderer.focus += (focusTarget - renderer.focus) * 0.08;
+  renderer.rotXW += (tiltTarget - renderer.rotXW) * 0.06;
   renderer.render();
   ui.setGauge((renderer.focus / W_SPAN + 1) / 2);
 
@@ -332,7 +382,8 @@ async function boot(): Promise<void> {
     ui.showError('this piece needs WebGL2 — your browser said no.');
     return;
   }
-  ui.setStatus('first visit: ~23 MB of weights, then it is all yours. nothing leaves this machine.');
+  ui.setStatus('first visit: ~37 MB of weights, then it is all yours. nothing leaves this machine. type while it loads.');
+  (document.getElementById('thought-input') as HTMLInputElement).focus({ preventScroll: true });
   window.addEventListener('error', (e) => ui.setStatus(`error: ${e.message}`));
   window.addEventListener('unhandledrejection', (e) => ui.setStatus(`error: ${e.reason instanceof Error ? e.reason.message : String(e.reason)}`));
   try {
@@ -350,10 +401,16 @@ async function boot(): Promise<void> {
   document.getElementById('thought-input')!.addEventListener('input', () => (lastInteract = performance.now()));
   setInterval(tourTick, 500);
   requestAnimationFrame(frame);
-  // a shared link shows its thought first; the tour picks up once idle
+  modelLoaded(); // a thought typed during the load goes first
+  if (model.dream)
+    void fetch('./models/dream/credits.json')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((c) => (credits = c))
+      .catch(() => {});
+  // then a shared link; the tour only starts if nobody has typed anything
   const shared = decodePermalink(location.hash);
-  if (shared) await runUserThought(shared);
-  else await tourShow(0);
+  if (shared && userSeq === 0) await runUserThought(shared);
+  else if (tour.on) await tourShow(0);
 }
 
 if (import.meta.env.PROD && 'serviceWorker' in navigator) {
@@ -376,11 +433,11 @@ async function cacheEverything(): Promise<string> {
       'models/minilm-l6/vocab.txt',
       'models/minilm-l6/onnx/model_quantized.onnx',
       'models/dream/dream_model.json',
-      'models/dream/prior.onnx',
       'models/dream/decoder.onnx',
       'models/dream/library_lat.bin',
       'models/dream/library_emb.bin',
       'models/dream/captions.json',
+      'models/dream/credits.json',
       'ort/ort-wasm-simd-threaded.jsep.wasm',
       'ort/ort-wasm-simd-threaded.jsep.mjs',
       'ort/ort-wasm-simd-threaded.wasm',

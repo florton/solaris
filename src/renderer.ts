@@ -1,9 +1,13 @@
 // Sculptural renderer: WebGL2. The piece has two bodies in one raymarcher:
 // the thought cloud (token positions fused into metaballs) and the
-// materialized form (per-layer SDF grids from the imagination decoder,
-// trilinearly sampled from 3D textures and lerped between the two layers
-// bracketing the focal plane). uMat crossfades cloud -> form: a thought
-// condenses. Lighting/iridescence/AO are field-agnostic, so both bodies share
+// materialized form: a 4D body f(x, y, z, w). Each layer's dreamed form is a
+// full signed distance field; all layers sit in one 3D texture, stacked along
+// z, and between neighbouring layers the body melts (full-SDF lerp, inflated
+// half-way so dissimilar forms pass through one fused mass). What you see is
+// a 3D slice of that body by a hyperplane at w = focus, tilted into x by
+// rotXW: tilted, one side of the form is already the next layer's shape (and
+// the slice foreshortens in x, as a real 4D rotation does). uMat crossfades
+// cloud -> form: a thought condenses. Lighting/iridescence/AO are field-agnostic, so both bodies share
 // the same gloss. Marched into an offscreen target at adaptive resolution and
 // composited with a chromatic fringe. Hover picking stays on the CPU
 // (projectVertices mirrors the transform).
@@ -11,6 +15,7 @@ import type { Sculpture } from './sculpture.ts';
 
 const W_SPAN = 1.5;
 const MAX_BALLS = 64;
+const MAX_LAYERS = 8; // uMelt array size
 
 const VERT_FULLSCREEN = `#version 300 es
 void main() {
@@ -33,9 +38,14 @@ uniform highp sampler2D uBalls; // 64x2 RGBA32F: row 0 = xyz+radius, row 1 = rgb
 uniform int uCount;
 uniform float uSmin;
 uniform float uBound;
-uniform highp sampler3D uVol0; // SDF grid of the layer below the focal plane
-uniform highp sampler3D uVol1; // SDF grid of the layer above
-uniform float uVolFr;  // lerp between the two grids
+uniform highp sampler3D uVol; // every layer's full SDF grid, stacked along z
+uniform float uLayers;  // how many layers are stacked
+uniform float uGrid;    // grid resolution per layer
+uniform float uMelt[${MAX_LAYERS}]; // inflation of the layer l -> l+1 melt
+uniform float uFocusW;  // where the slicing hyperplane crosses the w axis
+uniform float uWSpan;   // layers span w in [-uWSpan, uWSpan]
+uniform vec2 uTilt;     // (cos, sin) of the hyperplane's x-w tilt
+uniform float uStepK;   // march step scale: a tilted slice is steeper than a distance field
 uniform float uVolBound; // world half-extent of the grids
 uniform float uMat;    // 0 = thought cloud, 1 = materialized form
 out vec4 outColor;
@@ -45,11 +55,27 @@ float smin(float a, float b, float k) {
   return mix(b, a, h) - k * h * (1.0 - h);
 }
 
+float slab(vec3 uvw, float l) {
+  // clamp inside the layer's own slab so trilinear never bleeds into the next
+  float z = clamp(uvw.z * uGrid, 0.5, uGrid - 0.5);
+  return texture(uVol, vec3(uvw.xy, (l * uGrid + z) / (uGrid * uLayers))).r;
+}
+
 float formField(vec3 p) {
-  vec3 uvw = p / (2.0 * uVolBound) + 0.5;
-  float d = mix(texture(uVol0, uvw).r, texture(uVol1, uvw).r, uVolFr);
+  // the slice: p on the tilted hyperplane -> a point of the 4D body
+  vec3 q = vec3(p.x * uTilt.x, p.y, p.z);
+  float w = uFocusW + p.x * uTilt.y;
+  float t = clamp((w / uWSpan + 1.0) * 0.5, 0.0, 1.0) * (uLayers - 1.0);
+  float l0 = min(floor(t), max(uLayers - 2.0, 0.0));
+  float fr = t - l0;
+  vec3 uvw = q / (2.0 * uVolBound) + 0.5;
+  float a = slab(uvw, l0);
+  float b = uLayers > 1.0 ? slab(uvw, l0 + 1.0) : a;
+  // hold each layer's form near its own w, melt in between
+  float s = smoothstep(0.12, 0.88, fr);
+  float d = mix(a, b, s) - uMelt[int(l0)] * sin(3.14159265 * s);
   // intersect with the grid's own box so clamped-edge texels never leak
-  vec3 bq = abs(p) - vec3(uVolBound);
+  vec3 bq = abs(q) - vec3(uVolBound);
   float boxD = length(max(bq, 0.0)) + min(max(bq.x, max(bq.y, bq.z)), 0.0);
   return max(d, boxD);
 }
@@ -124,7 +150,7 @@ void main() {
     float dmin = 1e9;
     bool hit = false;
     // the form (thin parts, grazing rays) needs the long march; the smooth cloud does not
-    int maxSteps = uMat > 0.001 ? 160 : 64;
+    int maxSteps = uMat > 0.001 ? 200 : 64;
     for (int s = 0; s < maxSteps && t < t1; s++) {
       float d = map(ro + rd * t);
       dmin = min(dmin, d);
@@ -132,7 +158,7 @@ void main() {
         hit = true;
         break;
       }
-      t += max(d * 0.95, 0.0015); // never stall on a grazing ray
+      t += max(d * 0.95 * uStepK, 0.0015); // never stall on a grazing ray
     }
     if (hit) {
       vec3 p = ro + rd * t;
@@ -224,10 +250,12 @@ export class Renderer {
   persp4 = 3.2;
   matTarget = 0; // 1 once the imagination has delivered its grids
   private mat = 0;
-  // one R16F texture per layer, uploaded once when its grid arrives, so
-  // scrubbing the layer axis only rebinds
-  private layerTex: WebGLTexture[] = [];
+  // every layer's R16F grid in one 3D texture (stacked along z), each slab
+  // uploaded once when it arrives: the tilted slice can touch any layer
+  private volTex: WebGLTexture | null = null;
+  private volLayers = 0;
   private layerReady: boolean[] = [];
+  private melts = new Float32Array(MAX_LAYERS);
   private volGrid = 0;
   private volBound = 1.35;
   private dummyVol: WebGLTexture;
@@ -262,12 +290,12 @@ export class Renderer {
     // dummy 1^3 SDF grid from the start: the raymarch shader always samples
     // uVol0/uVol1, and an unbound (or type-conflicting) sampler3D invalidates
     // every draw call
-    this.dummyVol = this.makeVolTexture(1);
+    this.dummyVol = this.makeVolTexture(1, 1);
     gl.disable(gl.DEPTH_TEST);
     this.resize();
   }
 
-  private makeVolTexture(grid: number): WebGLTexture {
+  private makeVolTexture(grid: number, layers: number): WebGLTexture {
     const gl = this.gl;
     const t = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_3D, t);
@@ -276,7 +304,7 @@ export class Renderer {
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
-    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R16F, grid, grid, grid, 0, gl.RED, gl.HALF_FLOAT, null);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R16F, grid, grid, grid * layers, 0, gl.RED, gl.HALF_FLOAT, null);
     gl.bindTexture(gl.TEXTURE_3D, null);
     return t;
   }
@@ -338,24 +366,31 @@ export class Renderer {
    *  thoughts while the grid size stays the same). */
   initVolumes(nLayers: number, grid: number, bound: number): void {
     this.volBound = bound;
-    if (grid !== this.volGrid) {
-      for (const t of this.layerTex) this.gl.deleteTexture(t);
-      this.layerTex = [];
+    if (grid !== this.volGrid || nLayers !== this.volLayers || !this.volTex) {
+      if (this.volTex) this.gl.deleteTexture(this.volTex);
+      this.volTex = this.makeVolTexture(grid, nLayers);
       this.volGrid = grid;
+      this.volLayers = nLayers;
     }
-    while (this.layerTex.length < nLayers) this.layerTex.push(this.makeVolTexture(grid));
     this.layerReady = new Array(nLayers).fill(false);
+    this.melts.fill(0);
   }
 
-  /** One layer's half-float grid (x fastest): uploaded right away, once. */
+  /** One layer's half-float full SDF (x fastest): uploaded into its slab, once. */
   setLayerVolume(layer: number, vol: Uint16Array): void {
-    if (layer >= this.layerReady.length) return;
+    if (layer >= this.layerReady.length || !this.volTex) return;
     const gl = this.gl;
     const g = this.volGrid;
-    gl.bindTexture(gl.TEXTURE_3D, this.layerTex[layer]);
-    gl.texSubImage3D(gl.TEXTURE_3D, 0, 0, 0, 0, g, g, g, gl.RED, gl.HALF_FLOAT, vol);
+    gl.bindTexture(gl.TEXTURE_3D, this.volTex);
+    gl.texSubImage3D(gl.TEXTURE_3D, 0, 0, 0, layer * g, g, g, g, gl.RED, gl.HALF_FLOAT, vol);
     gl.bindTexture(gl.TEXTURE_3D, null);
     this.layerReady[layer] = true;
+  }
+
+  /** melts[l]: how much the layer l -> l+1 morph inflates half-way (world units). */
+  setMelts(melts: number[]): void {
+    this.melts.fill(0);
+    melts.slice(0, MAX_LAYERS).forEach((m, i) => (this.melts[i] = m));
   }
 
   resetVolumes(): void {
@@ -513,8 +548,8 @@ export class Renderer {
     this.mat += (this.matTarget - this.mat) * (1 - Math.exp(-dt / 0.7));
     if (this.mat < 1e-4 && this.matTarget === 0) this.mat = 0;
 
-    const { l0, l1, fr } = this.focusBracket();
-    const formOk = !!(this.layerReady[l0] && this.layerReady[l1]);
+    // the tilted slice samples every layer, so the form waits for all of them
+    const formOk = this.volCount > 0 && this.volCount === this.layerReady.length;
     this.updateBalls();
     // robust framing: follow the median ball distance for the cloud, the grid
     // bound for the form — blended with the condensation
@@ -540,21 +575,25 @@ export class Renderer {
     gl.uniform1i(ru('uCount'), Math.min(this.ballSel.length, MAX_BALLS));
     gl.uniform1f(ru('uSmin'), 0.38 * this.spreadK);
     gl.uniform1f(ru('uBound'), this.frameMax + 0.3 + (this.volBound * 1.15 - this.frameMax - 0.3) * this.mat);
-    // adjacent layers can dream unrelated forms, and a half-way SDF blend of two
-    // is a ghost of both: hold each form for most of the scrub, morph briefly
-    const frS = Math.min(1, Math.max(0, (fr - 0.3) / 0.4));
-    gl.uniform1f(ru('uVolFr'), frS * frS * (3 - 2 * frS));
     gl.uniform1f(ru('uVolBound'), this.volBound);
+    gl.uniform1f(ru('uLayers'), Math.max(1, this.volLayers));
+    gl.uniform1f(ru('uGrid'), Math.max(1, this.volGrid));
+    gl.uniform1fv(ru('uMelt'), this.melts);
+    gl.uniform1f(ru('uFocusW'), Math.max(-W_SPAN, Math.min(W_SPAN, this.focus)));
+    gl.uniform1f(ru('uWSpan'), W_SPAN);
+    const tc = Math.cos(this.rotXW);
+    const ts = Math.sin(this.rotXW);
+    gl.uniform2f(ru('uTilt'), tc, ts);
+    // along a tilted slice the field also changes with w (up to ~4 world units
+    // per unit w between dissimilar layers): shorten the steps to match
+    gl.uniform1f(ru('uStepK'), 1 / Math.sqrt(1 + 16 * ts * ts));
     gl.uniform1f(ru('uMat'), formOk ? this.mat : 0);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.ballTex);
     gl.uniform1i(ru('uBalls'), 0);
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_3D, formOk ? this.layerTex[l0] : this.dummyVol);
-    gl.uniform1i(ru('uVol0'), 1);
-    gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_3D, formOk ? this.layerTex[l1] : this.dummyVol);
-    gl.uniform1i(ru('uVol1'), 2);
+    gl.bindTexture(gl.TEXTURE_3D, formOk ? this.volTex : this.dummyVol);
+    gl.uniform1i(ru('uVol'), 1);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindVertexArray(this.emptyVAO);
     gl.drawArrays(gl.TRIANGLES, 0, 3);

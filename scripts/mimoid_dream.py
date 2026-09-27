@@ -1,17 +1,25 @@
-# Stage 2b of the mimoid imagination: dreaming by retrieval + SDEdit.
-# The prior alone blurs forms into an average (HANDOFF: prior v3), but it is
-# good at re-denoising a real form. So a thought dreams in three steps, per layer:
-#   1. retrieve: cosine between the thought's pooled embedding and every
-#      library caption embedding of the same layer; pick one of the top k,
-#      weighted by exp((sim - best) / temp)
-#   2. noise the picked form's latent to t0 (live channels, normalized)
-#   3. denoise it back with the prior, conditioned on the thought (CFG)
-# Everything random comes from one mulberry32 stream seeded by FNV-1a(text),
-# both portable to the browser, so a thought always dreams the same forms.
+# Stage 2b of the mimoid imagination: dreaming = retrieval + a 4D walk.
+# The reference the browser (src/dream.ts, src/dream-worker.ts) must match:
+#   1. retrieve: cosine between the thought's sentence embedding (pooled layer
+#      6: what all-MiniLM-L6-v2 was trained to output) and every kept library
+#      caption (scripts/mimoid_quality.py drops fragments, AE-broken forms,
+#      multi-object scenes and dioramas); the top `pool` are the neighbourhood
+#   2. walk the layers deepest first, each drawing a different form from the
+#      neighbourhood, weighted by exp((sim - best) / temp); temp widens toward
+#      the shallow layers (deep = closest match, shallow = looser association)
+#   3. decode, extend each truncated SDF to a full distance field (EDT), and
+#      between neighbouring layers melt: lerp the full fields along w and
+#      inflate the middle so dissimilar forms pass through one fused mass
+#      instead of tearing (plain truncated-SDF lerps vanish half-way)
+# One mulberry32 stream seeded by FNV-1a(text): same thought, same body.
 #
-# Needs data/mimoid_grid.pt, data/mimoid_prior.pt, data/mimoid_captions.npz.
-# 8 DDIM steps from t0 0.4 look the same as 16 (or 4); the browser pays per step.
-# Run: .venv/Scripts/python scripts/mimoid_dream.py [--t0 0.4] [--k 8]
+# Retired (kept for diagnostics): SDEdit with the prior after retrieval. It
+# shreds thin forms (helicopter rotors, sword blades) and cost the browser
+# 33 MB + ~10 s per thought; `Dreamer.sdedit`/`dream` still run it.
+#
+# Needs data/mimoid_grid.pt, data/mimoid_captions.npz, data/mimoid_quality.npz
+# (and data/mimoid_prior.pt for the SDEdit path).
+# Run: .venv/Scripts/python scripts/mimoid_dream.py [--tag _x]
 import argparse
 import math
 import sys
@@ -23,7 +31,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from imagination_corpus import write_png  # noqa: E402
 from mimoid_captions import embed  # noqa: E402
-from mimoid_data import render_grids  # noqa: E402
+from mimoid_data import G, TRUNC, render_grids  # noqa: E402
 from mimoid_train_ae import GridDecoder, sheet, to_int8  # noqa: E402
 from mimoid_train_prior import PROMPTS, Prior, alpha_sigma  # noqa: E402
 
@@ -33,6 +41,9 @@ PRIOR = ROOT / "data" / "mimoid_prior.pt"
 CAPS = ROOT / "data" / "mimoid_captions.npz"
 PREVIEW_DIR = ROOT / "previews" / "mimoid_dream"
 N_LAYERS = 7
+# the browser's dreaming parameters (exported into dream_model.json)
+WALK = {"pool": 24, "tempDeep": 0.02, "tempShallow": 0.08, "meltMin": 0.06, "meltMax": 0.25, "meltKeep": 1.1}
+EMB_LAYER = 6
 THOUGHTS = ["a whale drifting through fog", "my grandmother's kitchen in november",
             "the hum of a server room at 3am", "an argument I keep rehearsing",
             "cathedral light on dust", "a city seen from a night train"]
@@ -130,40 +141,92 @@ class Dreamer:
         return np.concatenate([to_int8(self.dec(b)) for b in full.split(16)])
 
 
+def pick_forms(sims: np.ndarray, seed: int, n_layers: int = N_LAYERS, pool=WALK["pool"],
+               temp_deep=WALK["tempDeep"], temp_shallow=WALK["tempShallow"]):
+    """sims [N] (excluded forms at -inf) -> [(index, sim)] per layer, all distinct. Mirrors pickForms."""
+    top = np.argsort(-sims, kind="stable")[:pool]
+    ts = sims[top]
+    u = mulberry32(seed, n_layers)
+    left = list(range(pool))
+    picks = [None] * n_layers
+    for n, l in enumerate(range(n_layers - 1, -1, -1)):
+        temp = temp_shallow + (temp_deep - temp_shallow) * (l / (n_layers - 1))
+        w = np.exp((ts[left] - ts[0]) / temp)
+        k = int(np.searchsorted(np.cumsum(w / w.sum()), u[n]))
+        k = min(k, len(left) - 1)
+        j = left.pop(k) if len(left) > 1 else left[0]
+        picks[l] = (int(top[j]), float(ts[j]))
+    return picks
+
+
+def full_sdf(g: np.ndarray, h: float, trunc: float = TRUNC) -> np.ndarray:
+    """truncated SDF in world units -> full signed distance (band kept, EDT beyond). Mirrors fullSdf."""
+    from scipy.ndimage import distance_transform_edt
+    band = trunc * 0.98
+    inb = np.abs(g) < band
+    dist = np.minimum(distance_transform_edt(~inb), 2 * g.shape[0])
+    return np.where(inb, g, np.sign(np.where(g == 0, 1, g)) * (band + (dist - 1) * h)).astype(np.float32)
+
+
+def melt_amount(a: np.ndarray, b: np.ndarray) -> float:
+    """inflation at the a -> b midpoint keeping meltKeep of the smaller volume. Mirrors meltAmount."""
+    target = int(WALK["meltKeep"] * min((a < 0).sum(), (b < 0).sum()))
+    if target <= 0:
+        return WALK["meltMin"]
+    mid = np.sort((0.5 * (a + b)).ravel())
+    return float(np.clip(mid[target], WALK["meltMin"], WALK["meltMax"]))
+
+
+def body_at(fields, melts, t: float) -> np.ndarray:
+    """the 4D body's slice at layer coordinate t in [0, L-1] (the shader's formField, untilted)"""
+    l0 = min(int(np.floor(t)), len(fields) - 2)
+    fr = t - l0
+    s = np.clip((fr - 0.12) / 0.76, 0, 1)
+    s = s * s * (3 - 2 * s)
+    return (1 - s) * fields[l0] + s * fields[l0 + 1] - melts[l0] * np.sin(np.pi * s)
+
+
+class Walker:
+    """The browser's dreamer: kept library, sentence-embedding retrieval, full SDF fields."""
+
+    def __init__(self, dev="cuda"):
+        from mimoid_quality import OUT as QUALITY, keep
+        self.d = Dreamer(dev)
+        self.keep = keep(dict(np.load(QUALITY)))
+        self.h = 2.0 / (G - 1)
+
+    def walk(self, text: str, emb6: np.ndarray):
+        sims = (self.d.cap_emb[:, EMB_LAYER] @ torch.as_tensor(emb6, device=self.d.dev)).cpu().numpy()
+        sims[~self.keep] = -np.inf
+        picks = pick_forms(sims, fnv1a(text))
+        g = self.d.grids(self.d.lat[[i for i, _ in picks]]).astype(np.float32) / 127 * TRUNC
+        fields = [full_sdf(x, self.h) for x in g]
+        melts = [melt_amount(fields[l], fields[l + 1]) for l in range(len(fields) - 1)]
+        return picks, fields, melts
+
+
+def to_grid(f: np.ndarray) -> np.ndarray:
+    return (np.clip(f / TRUNC, -1, 1) * 127).round().astype(np.int8)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--t0", type=float, default=0.4)
-    ap.add_argument("--k", type=int, default=8)
-    ap.add_argument("--temp", type=float, default=0.05)
-    ap.add_argument("--guidance", type=float, default=3.0)
-    ap.add_argument("--tag", default="", help="suffix for the preview file names")
-    ap.add_argument("--variants", type=int, default=5, help="seed variants per prompt in the prompt sheet")
+    ap.add_argument("--tag", default="", help="suffix for the preview file name")
+    ap.add_argument("--samples", type=int, default=13, help="slices along w per thought")
     args = ap.parse_args()
     PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
-    d = Dreamer("cuda" if torch.cuda.is_available() else "cpu")
-    kw = dict(t0=args.t0, k=args.k, temp=args.temp, guidance=args.guidance)
-
-    # 1. prompts (last layer): the text's own seed first, then seed variants
-    prompts = PROMPTS + ["a lighthouse on a cliff", "an old castle tower on a hill"]
-    embs = embed(prompts)
-    tiles = []
-    for p, e in zip(prompts, embs):
-        z = torch.cat([d.dream(e, fnv1a(p) + v, layers=[6], **kw)[0] for v in range(args.variants)])
-        tiles.append(render_grids(d.grids(z)))
-    write_png(PREVIEW_DIR / f"prompts{args.tag}.png", sheet(np.concatenate(tiles), args.variants))
-    print(f"prompts.png: rows {prompts}, cols = seed variants (L6)")
-
-    # 2. thoughts: one strip per thought, layers 0..6 as the app would show them
-    thoughts = THOUGHTS + ["a horse", "a man's head"]
+    w = Walker("cuda" if torch.cuda.is_available() else "cpu")
+    thoughts = THOUGHTS + ["a horse", "a knife and an arrow", "ants on a log", "a helicopter", "a man's head"]
     tiles = []
     for t, e in zip(thoughts, embed(thoughts)):
-        z, picks = d.dream(e, fnv1a(t), **kw)
-        tiles.append(render_grids(d.grids(z)))
-        print(f"\n'{t}' (seed {fnv1a(t)})")
-        for l, (i, cand, sims) in enumerate(picks):
-            print(f"  L{l}  {sims[cand.index(i)]:.3f}  {d.captions[i]}")
-    write_png(PREVIEW_DIR / f"thoughts{args.tag}.png", sheet(np.concatenate(tiles), N_LAYERS))
-    print(f"\nthoughts.png: rows {thoughts}, cols = layers 0..6")
+        picks, fields, melts = w.walk(t, e[EMB_LAYER])
+        print(f"\n'{t}'  melts " + " ".join(f"{m:.2f}" for m in melts))
+        for l, (i, sim) in enumerate(picks):
+            print(f"  L{l}  {sim:.3f}  {w.d.captions[i]}")
+        ts = np.linspace(0, N_LAYERS - 1, args.samples)
+        tiles.append(render_grids(np.stack([to_grid(body_at(fields, melts, x)) for x in ts])))
+    write_png(PREVIEW_DIR / f"walk{args.tag}.png", sheet(np.concatenate(tiles), args.samples))
+    print(f"\nwalk{args.tag}.png: one row per thought, {args.samples} slices along w (layer 0 -> 6)")
 
 
 if __name__ == "__main__":
