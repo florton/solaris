@@ -410,7 +410,7 @@ async function boot(): Promise<void> {
   // then a shared link; the tour only starts if nobody has typed anything
   const shared = decodePermalink(location.hash);
   if (shared && userSeq === 0) await runUserThought(shared);
-  else if (tour.on) await tourShow(0);
+  else if (tour.on) await tourShow(Math.floor(Math.random() * PRESETS.length));
 }
 
 if (import.meta.env.PROD && 'serviceWorker' in navigator) {
