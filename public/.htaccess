@@ -1,0 +1,16 @@
+# Served from /solaris/ on Apache. Vite copies this into dist/ on build.
+
+# Plain http is an insecure context: browsers warn, and crossOriginIsolated
+# (below) never turns on. Send every request to https.
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteCond %{HTTPS} off
+  RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+</IfModule>
+
+# COOP/COEP make the page crossOriginIsolated, enabling SharedArrayBuffer and
+# onnxruntime-web's threaded wasm (same headers vite.config.ts sets in dev).
+<IfModule mod_headers.c>
+  Header always set Cross-Origin-Opener-Policy "same-origin"
+  Header always set Cross-Origin-Embedder-Policy "require-corp"
+</IfModule>
