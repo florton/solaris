@@ -8,7 +8,7 @@
 // Dreams run strictly one after another (FIFO); a cancelled one bails between
 // layers. Grids go out as half floats, ready to upload.
 import * as ort from 'onnxruntime-web';
-import { fullSdf, libraryLatent, meltAmount, pickForms, type DreamMeta } from './dream.ts';
+import { fullSdf, libraryLatent, meltAmount, pickForms, similarities, type DreamMeta } from './dream.ts';
 import { f32ToF16 } from './half.ts';
 
 interface Dreamer {
@@ -110,12 +110,19 @@ async function latents(d: Dreamer, rows: number[]): Promise<Float32Array[]> {
 const yieldToEvents = () => new Promise<void>((r) => setTimeout(r, 0));
 
 /** One thought -> one form per layer (posted as each finishes), then the melt
- *  amount for every pair of neighbouring layers. */
-async function dream(reqId: number, query: Float32Array, seed: number): Promise<void> {
+ *  amount for every pair of neighbouring layers. `phraseQueries` (two or more,
+ *  or none) are the thought's phrases; the ones with a good enough match are
+ *  dreamt in order, else the whole thought is. */
+async function dream(reqId: number, query: Float32Array, phraseQueries: Float32Array[], seed: number): Promise<void> {
   const d = dreamer!;
   const { meta } = d;
   const tStart = performance.now();
-  const picks = pickForms(meta, d.emb, query, seed);
+  let sims = phraseQueries
+    .map((q) => similarities(meta, d.emb, q))
+    .filter((s) => s.reduce((a, b) => Math.max(a, b), -Infinity) >= meta.dream.minSim)
+    .slice(0, meta.dream.maxPhrases);
+  if (sims.length <= 1) sims = [similarities(meta, d.emb, query)];
+  const picks = pickForms(meta, d.emb, sims, seed);
   const zs = await latents(
     d,
     picks.map((p) => p.index),
@@ -147,11 +154,12 @@ self.onmessage = (e: MessageEvent) => {
   } else if (msg.type === 'dream') {
     const { reqId, seed } = msg as { reqId: number; seed: number };
     const query = new Float32Array(msg.query);
+    const phraseQueries = ((msg.phraseQueries ?? []) as ArrayBuffer[]).map((b) => new Float32Array(b));
     queue = queue.then(async () => {
       try {
         await loaded;
         if (!dreamer) throw new Error('imagination unavailable');
-        if (!cancelled.has(reqId)) await dream(reqId, query, seed);
+        if (!cancelled.has(reqId)) await dream(reqId, query, phraseQueries, seed);
       } catch (err) {
         self.postMessage({ type: 'failed', reqId, message: err instanceof Error ? err.message : String(err) });
       } finally {

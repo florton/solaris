@@ -303,9 +303,29 @@ starts if nobody typed. The HUD moved top-left (5 lines ran under the input).
 Tour presets re-picked for the walk: 14 (owl, church bell, sailing ship, dragon replace the sleeping
 giant and cathedral light). Scratchpad `presets_walk.py`.
 
+## Scene walk (2026-09-27)
+A scene thought gave one object on every layer: "tea in grandmas kitchen during a rainstorm"'s
+whole-sentence top 24 were all teapots (0.53), while "grandma's kitchen" (cabinet, clock, stone
+house, 0.44) and "a rainstorm" (clouded mountains, umbrella, 0.45) never made the pool.
+- `phrases()` splits the thought at connecting words (`WALK.connect`: in, during, on, through,
+  and, …; "of" doesn't split). Each phrase is encoded on its own (one extra encoder run per phrase,
+  in `model.ts` `sendDream`) and gets its own neighbourhood. Phrases whose best match is under
+  `minSim` 0.35 are dropped; with ≤ 1 left, the whole thought is dreamt as before.
+- `allot()`: the first phrase (the subject) takes the deep layers, later phrases the shallower
+  ones: [7], [5, 2], [3, 2, 2], [2, 2, 2, 1]. Tea now walks teapots -> cabinet -> foggy sky; knight
+  -> dragon -> mountains; fox -> snowy mountains.
+- Neighbourhoods count same-caption repeats (caption cos > `dup` 0.99) once. Identical captions
+  are *not* identical shapes (the 24 "a pink teapot." forms have latent cos 0.1–0.92); only ~420
+  kept forms are shape duplicates (latent cos > 0.99), so the library itself is untouched.
+- `mimoid_dream.py --flat` renders the old walk: `previews/mimoid_dream/walk_flat.png` vs
+  `walk_scene.png`. `dream_model.json` got the new `dream` keys (only that key changed).
+- Weak spot: atmosphere words ("a storm", "a dream", "fog") pass minSim on loose matches (red
+  spiral, teddy bear). That's a library gap, not a picker one.
+
 ## Next steps
 1. **Grow the library** (the real limit on "does the form relate to my prompt": no ants, guitars
-   or anchors exist). The AE doesn't need retraining: `mimoid_grid_ckpt.pt` has the encoder. Needs:
+   or anchors exist; for scene thoughts, weather/atmosphere forms in the mimoid feel: storms,
+   fog, rain, clouds, night). The AE doesn't need retraining: `mimoid_grid_ckpt.pt` has the encoder. Needs:
    `select` with bigger quotas / new families (tools, instruments, insects, furniture), overnight
    `build`, an encode-only script for new grids, then captions -> quality -> export. The browser cost
    is 384 B/form for the index (latents stream / Range-fetch).

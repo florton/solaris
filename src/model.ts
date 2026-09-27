@@ -5,7 +5,7 @@
 // per-layer embeddings -> forms.
 import { WordPieceTokenizer } from './tokenizer.ts';
 import { poolEmbedding } from './bridge.ts';
-import { fnv1a, type DreamMeta } from './dream.ts';
+import { fnv1a, phrases, type DreamMeta } from './dream.ts';
 
 export interface ModelMeta {
   id: string;
@@ -162,6 +162,7 @@ export class SolarisModel {
   private forwardCounter = 0;
   private dreams = new Map<number, DreamHandlers>();
   private dreamCounter = 0;
+  private encoding = new Set<number>(); // dreams whose phrases are still being encoded
   private dreamWorker: DreamHost | null = null;
   public dream: DreamMeta | null = null;
   public dreamStatus: DreamStatus = { state: 'off' };
@@ -302,14 +303,37 @@ export class SolarisModel {
   requestDream(text: string, result: ForwardResult, handlers: DreamHandlers): number | null {
     if (!this.dreamWorker || this.dreamStatus.state === 'unavailable') return null;
     const reqId = ++this.dreamCounter;
-    const query = result.pooled[this.dream!.embLayer].slice();
     this.dreams.set(reqId, handlers);
-    this.dreamWorker.postMessage({ type: 'dream', reqId, query: query.buffer, seed: fnv1a(text) }, [query.buffer]);
+    this.encoding.add(reqId);
+    void this.sendDream(reqId, text, result);
     return reqId;
+  }
+
+  /** Encode the thought's phrases (when it splits into two or more), then hand
+   *  the dream to the worker. A failed phrase encode dreams the whole thought. */
+  private async sendDream(reqId: number, text: string, result: ForwardResult): Promise<void> {
+    const layer = this.dream!.embLayer;
+    const query = result.pooled[layer].slice();
+    const split = phrases(text, this.dream!.dream);
+    let phraseQueries: Float32Array[] = [];
+    if (split.length > 1) {
+      try {
+        phraseQueries = (await Promise.all(split.map((p) => this.forward(p)))).map((r) => r.pooled[layer].slice());
+      } catch {
+        phraseQueries = [];
+      }
+    }
+    if (!this.encoding.delete(reqId)) return; // cancelled while its phrases were encoding
+    const buffers = [query.buffer, ...phraseQueries.map((q) => q.buffer)];
+    this.dreamWorker!.postMessage(
+      { type: 'dream', reqId, query: query.buffer, phraseQueries: phraseQueries.map((q) => q.buffer), seed: fnv1a(text) },
+      buffers,
+    );
   }
 
   cancelDream(reqId: number): void {
     if (!this.dreams.delete(reqId)) return;
+    if (this.encoding.delete(reqId)) return; // never reached the worker
     this.dreamWorker?.postMessage({ type: 'cancel', reqId });
   }
 }

@@ -1,14 +1,22 @@
 // The dreamer's plain math (the ONNX decoder lives in dream-worker.ts). A
 // thought dreams one form per layer, all from the same neighbourhood of the
 // library, and the layers become one 4D body. Mirrors scripts/mimoid_dream.py:
-//   1. retrieve: cosine between the thought's sentence embedding (the last
+//   1. split the thought into phrases at connecting words ("tea | grandmas
+//      kitchen | a rainstorm"); phrases whose best match is under minSim are
+//      dropped, and with one phrase (or none) left the whole thought is it.
+//      Unsplit, the dominant noun owns every layer (the tea thought's top 24
+//      were all teapots)
+//   2. retrieve per phrase: cosine between its sentence embedding (the last
 //      layer's pooled state: what MiniLM was trained to output) and every
-//      library caption; the top `pool` forms are the thought's neighbourhood
-//   2. walk the layers deepest first, each drawing a different form from the
-//      neighbourhood, weighted by exp((sim - best) / temp). temp widens toward
-//      the shallow layers, so the deep layers dream the closest match and the
-//      shallow ones looser associations of it
-//   3. decode each form's latent, extend its truncated SDF to a full distance
+//      library caption; the top `pool` forms, same-caption repeats counted
+//      once, are the phrase's neighbourhood
+//   3. walk the layers deepest first: the first phrase (the subject) takes the
+//      deep layers, each later phrase the next ones up (`allot`), so the walk
+//      along w reads as a scene. Each layer draws a different form from its
+//      phrase's neighbourhood, weighted by exp((sim - best) / temp). temp
+//      widens toward the shallow layers, so the deep layers dream the closest
+//      match and the shallow ones looser associations of it
+//   4. decode each form's latent, extend its truncated SDF to a full distance
 //      field (so neighbouring layers can melt into each other along w)
 // The only randomness is one mulberry32 stream seeded by FNV-1a(text): same
 // thought, same forms, forever.
@@ -25,7 +33,19 @@ export interface DreamMeta {
   grid: number; // decoder output is grid³, x fastest
   bound: number; // world half-extent of the grid (texel centers span [-1, 1])
   trunc: number; // the decoder's SDF is clipped to ±trunc (world units)
-  dream: { pool: number; tempDeep: number; tempShallow: number; meltMin: number; meltMax: number; meltKeep: number };
+  dream: {
+    pool: number;
+    tempDeep: number;
+    tempShallow: number;
+    meltMin: number;
+    meltMax: number;
+    meltKeep: number;
+    minSim: number; // a phrase whose best match is weaker tells no story and is dropped
+    dup: number; // same-caption repeats (embedding cosine above this) count once in a neighbourhood
+    maxPhrases: number;
+    connect: string[]; // a phrase ends at these words
+    stop: string[]; // a phrase of only these words is dropped
+  };
   params: number;
   dtype: string;
   credit: string;
@@ -41,51 +61,111 @@ export function fnv1a(text: string): number {
 export interface Pick {
   index: number;
   sim: number;
+  phrase: number; // which of the dreamt phrases it came from
 }
 
-/** One distinct library form per layer, deepest layer first. */
-export function pickForms(meta: DreamMeta, emb: Int8Array, query: Float32Array, seed: number): Pick[] {
-  const { n, hiddenDim: D, layers: L } = meta;
-  const { pool: K, tempDeep, tempShallow } = meta.dream;
+/** Split a thought at connecting words; phrases of only stop words are dropped. */
+export function phrases(text: string, walk: DreamMeta['dream']): string[] {
+  const connect = new Set(walk.connect ?? []);
+  const stop = new Set(walk.stop ?? []);
+  const out: string[][] = [];
+  let cur: string[] = [];
+  for (const w of text.toLowerCase().match(/[a-z0-9']+/g) ?? []) {
+    if (connect.has(w)) {
+      if (cur.length) out.push(cur);
+      cur = [];
+    } else cur.push(w);
+  }
+  if (cur.length) out.push(cur);
+  return out.filter((p) => p.some((w) => !stop.has(w))).map((p) => p.join(' '));
+}
+
+/** Layers per phrase, the first (deepest) phrase first: [7], [5, 2], [3, 2, 2], [2, 2, 2, 1]. */
+export function allot(nPhrases: number, nLayers: number): number[] {
+  if (nPhrases <= 1) return [nLayers];
+  const first = Math.max(2, nLayers - 2 * (nPhrases - 1));
+  const rest = nLayers - first;
+  const m = nPhrases - 1;
+  return [first, ...Array.from({ length: m }, (_, i) => Math.floor(rest / m) + (i < rest % m ? 1 : 0))];
+}
+
+/** Cosine between a query embedding and every library caption. */
+export function similarities(meta: DreamMeta, emb: Int8Array, query: Float32Array): Float32Array {
+  const { n, hiddenDim: D } = meta;
   const q = new Float32Array(D);
   for (let d = 0; d < D; d++) q[d] = query[d] * meta.embScale[d];
-  const topS = new Float64Array(K).fill(-Infinity);
-  const topI = new Int32Array(K).fill(-1);
+  const sims = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     const o = i * D;
     let s = 0;
     for (let d = 0; d < D; d++) s += q[d] * emb[o + d];
-    if (s <= topS[K - 1]) continue;
-    let j = K - 1;
-    while (j > 0 && topS[j - 1] < s) {
-      topS[j] = topS[j - 1];
-      topI[j] = topI[j - 1];
-      j--;
-    }
-    topS[j] = s;
-    topI[j] = i;
+    sims[i] = s;
   }
+  return sims;
+}
+
+/** Cosine between two library captions' (dequantized) embeddings. */
+function captionCos(meta: DreamMeta, emb: Int8Array, i: number, j: number): number {
+  const D = meta.hiddenDim;
+  let ab = 0;
+  let aa = 0;
+  let bb = 0;
+  for (let d = 0; d < D; d++) {
+    const s2 = meta.embScale[d] * meta.embScale[d];
+    const a = emb[i * D + d];
+    const b = emb[j * D + d];
+    ab += a * b * s2;
+    aa += a * a * s2;
+    bb += b * b * s2;
+  }
+  return ab / (Math.sqrt(aa * bb) || 1);
+}
+
+/** The top `pool` forms not yet taken, skipping same-caption repeats. */
+function neighbourhood(meta: DreamMeta, emb: Int8Array, sims: Float32Array, taken: Set<number>): number[] {
+  const order = Array.from({ length: meta.n }, (_, i) => i).sort((a, b) => sims[b] - sims[a] || a - b);
+  const top: number[] = [];
+  for (const i of order) {
+    if (top.length === meta.dream.pool) break;
+    if (taken.has(i) || top.some((j) => captionCos(meta, emb, i, j) > meta.dream.dup)) continue;
+    top.push(i);
+  }
+  return top;
+}
+
+/** One distinct library form per layer, deepest layer first: the first
+ *  phrase's sims take the deep layers, each later phrase's the next ones up. */
+export function pickForms(meta: DreamMeta, emb: Int8Array, simsPerPhrase: Float32Array[], seed: number): Pick[] {
+  const { layers: L } = meta;
+  const { tempDeep, tempShallow } = meta.dream;
   const rand = mulberry32(seed);
-  const left = Array.from({ length: K }, (_, j) => j);
   const picks: Pick[] = new Array(L);
-  for (let l = L - 1; l >= 0; l--) {
-    const temp = tempShallow + (tempDeep - tempShallow) * (L <= 1 ? 1 : l / (L - 1));
-    const u = rand();
-    const w = left.map((j) => Math.exp((topS[j] - topS[0]) / temp));
-    const total = w.reduce((a, b) => a + b, 0);
-    let cum = 0;
-    let k = left.length - 1;
-    for (let m = 0; m < left.length; m++) {
-      cum += w[m] / total;
-      if (cum >= u) {
-        k = m;
-        break;
+  const taken = new Set<number>();
+  const counts = allot(simsPerPhrase.length, L);
+  let l = L - 1;
+  simsPerPhrase.forEach((sims, p) => {
+    const top = neighbourhood(meta, emb, sims, taken);
+    const left = top.map((_, j) => j);
+    for (let c = 0; c < counts[p]; c++, l--) {
+      const temp = tempShallow + (tempDeep - tempShallow) * (L <= 1 ? 1 : l / (L - 1));
+      const u = rand();
+      const w = left.map((j) => Math.exp((sims[top[j]] - sims[top[0]]) / temp));
+      const total = w.reduce((a, b) => a + b, 0);
+      let cum = 0;
+      let k = left.length - 1;
+      for (let m = 0; m < left.length; m++) {
+        cum += w[m] / total;
+        if (cum >= u) {
+          k = m;
+          break;
+        }
       }
+      const j = left[k];
+      if (left.length > 1) left.splice(k, 1);
+      picks[l] = { index: top[j], sim: sims[top[j]], phrase: p };
+      taken.add(top[j]);
     }
-    const j = left[k];
-    if (left.length > 1) left.splice(k, 1);
-    picks[l] = { index: topI[j], sim: topS[j] };
-  }
+  });
   return picks;
 }
 
