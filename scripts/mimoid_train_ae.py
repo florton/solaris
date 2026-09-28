@@ -13,6 +13,7 @@
 # Run: .venv/Scripts/python scripts/mimoid_train_ae.py [--arch grid] [--hours 8] [--stop-hours 1] [--resume]
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -24,7 +25,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from imagination_corpus import write_png  # noqa: E402
-from mimoid_data import G, OUT_DIR, TRUNC, load_library, render_grids  # noqa: E402
+from mimoid_data import G, OUT_DIR, TRUNC, render_grids  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 Z_DIM = 256
@@ -143,8 +144,20 @@ def load_all(tag):
         meta = json.loads(uid_cache.read_text())
         if meta["shards"] == n_shards:
             return np.load(cache, mmap_mode="r"), meta["uids"]
-    grids, uids = load_library(tag)
-    np.save(cache, grids)
+    # stream shard by shard into the memmap: concatenating in RAM needs 2× the library (13 GB at 25k forms)
+    shards = sorted(OUT_DIR.glob(f"{tag}_[0-9]*.npz"))
+    counts = [len(np.load(p)["uids"]) for p in shards]
+    tmp = cache.with_name(cache.stem + ".tmp.npy")
+    out = np.lib.format.open_memmap(tmp, mode="w+", dtype=np.int8, shape=(sum(counts), G, G, G))
+    uids, i = [], 0
+    for p, n in zip(shards, counts):
+        z = np.load(p)
+        out[i : i + n] = z["grids"]
+        uids += [str(u) for u in z["uids"]]
+        i += n
+    out.flush()
+    del out
+    os.replace(tmp, cache)
     uid_cache.write_text(json.dumps({"shards": n_shards, "uids": uids}))
     return np.load(cache, mmap_mode="r"), uids
 

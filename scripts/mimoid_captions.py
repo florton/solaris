@@ -46,8 +46,12 @@ def embed(texts, log=False):
 def main():
     caps = json.load(gzip.open(CAPTIONS))
     uids = json.loads(UIDS.read_text())["uids"]  # same order as library_all.npy / the AE latents
+    missing = [u for u in uids if u not in caps]
+    if missing:  # objects Cap3D's release lacks: the manifest's caption (cap3d.csv or the LVIS name)
+        rows = (json.loads(l) for l in open(ROOT / "data" / "mimoid" / "library.jsonl", encoding="utf-8"))
+        caps.update({r["uid"]: r["caption"] for r in rows if r["uid"] in set(missing)})
     texts = [caps[u].strip() for u in uids]
-    print(f"{len(texts)} captions")
+    print(f"{len(texts)} captions ({len(missing)} from the manifest)")
     out = embed(texts, log=True).astype(np.float16)
 
     np.savez(OUT, uids=np.array(uids), captions=np.array(texts), emb=out,

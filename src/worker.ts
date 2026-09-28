@@ -40,6 +40,7 @@ self.onmessage = async (e: MessageEvent) => {
       const t0 = performance.now();
       const buf = await (await fetch(msg.modelUrl)).arrayBuffer();
       self.postMessage({ type: 'status', msg: `weights in (${(buf.byteLength / 1e6).toFixed(0)} MB), compiling ${msg.backend}…` });
+      self.postMessage({ type: 'weights' }); // the watchdog times compiling only, not the download
       session = await ort.InferenceSession.create(buf, {
         executionProviders: [msg.backend],
         graphOptimizationLevel: 'all',

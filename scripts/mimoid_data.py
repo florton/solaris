@@ -4,7 +4,8 @@
 #            need (license, glb size, face count, name, author, url)
 #   select   bucket Cap3D captions (+ LVIS labels) into families, filter to
 #            commercial-friendly licenses (CC-BY / CC-BY-SA / CC0) and bounded
-#            file sizes, fill per-family quotas deterministically
+#            file sizes, fill per-family quotas deterministically;
+#            --extend appends the settings/atmosphere families instead
 #   build    stream each GLB, convert to a 64³ truncated SDF (int8), delete the
 #            GLB; resumable, sharded
 #   preview  render a contact sheet per family (GPU sphere tracing)
@@ -21,6 +22,7 @@ import sys
 import time
 import urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 
 import numpy as np
@@ -80,6 +82,36 @@ LVIS_ANIMALS = {"owl", "lion", "rabbit", "elephant", "crab_(animal)", "shark", "
 PRIORITY = list(FAMILIES)
 # captions that describe flat graphics / text rather than forms
 JUNK = re.compile(r"\b(kitchen|dew|bike|bicycle|terrain|landscape|tile|ground|floor|patch|text|logo|letter|letters|word|words|sign|card|poster|map|diagram|icon|emoji|texture|pattern|flag|painting|picture|photo|image|screen|number|alphabet)\b", re.I)
+# things that break the mood: toys, plushies, cartoon/IP characters, voxel art
+# (also drops existing library forms at export, via mimoid_quality.py)
+MOOD = re.compile(r"\b(toy|toys|plush\w*|stuffed|teddy|lego|chibi|kawaii|funko|pok[eé]mon|pikachu|minecraft|smiley|"
+                  r"cartoon\w*|doll|dolls|keychain|keyring|pinata|disney|pixar|anime|mcqueen|mario|sonic|spongebob|"
+                  r"pixelated|my little pony|rainbow dash|no[- ]face|spirited away|five nights at freddy'?s|mickey mouse|"
+                  r"transformers|ice cream|cakes?|cupcakes?|lollipops?|candy|sushi|skateboards?|kites?|soda|beer|can of|"
+                  r"rain ?boots?|rubber boots?|gumboots?|rain ?jacket|raincoat)\b|(?<!hot air )(?<!hot-air )\bballoons?\b", re.I)
+
+# `select --extend`: settings and atmosphere, so a scene thought's middle and
+# shallow layers have somewhere to go ("tea in grandmas kitchen during a
+# rainstorm": the storm had only clouded mountains). Appended to the manifest;
+# the regex's matched keyword is round-robined so one keyword (5.8k staircases,
+# 2k catalog lamps) can't fill a family. family -> (quota, regex, exclude)
+EXTRA_FAMILIES = {
+    "weather":    (600, r"\b(cloud|clouds|cloudy|storm|storms|thunderstorm|thundercloud|raincloud|rain|raindrop|raindrops|lightning|tornado|hurricane|cyclone|twister|fog|foggy|mist|misty|snowflake|snowflakes|snowstorm|blizzard|rainbow|icicle|icicles|frost)\b",
+                   r"point cloud|rainbow[- ](colou?red|striped)|word cloud|cloud (server|computing|storage)"),
+    "water":      (1200, r"\b(wave|waves|fountain|fountains|(?:wishing|water|stone|wooden|old) well|waterfall|waterfalls|whirlpool|splash|droplet|droplets|water ?drop|puddle|pond|lake|river|sea|ocean|anchor|buoy|pier|dock|jetty|reef|body of water)\b",
+                   r"water (bottle|filter|heater|gun|tank|pump|cooler|tap|dispenser)|filtration|flosser|docking|dock station|sea ?shell"),
+    "light":      (2000, r"\b(lantern|lanterns|candle|candles|candlestick|candelabra|chandelier|torch|torches|sconce|lamppost|lamp post|streetlight|street light|street lamp|oil lamp|stone lamp|beacon|brazier|moon|crescent|sun|planet|comet|light bulb|lightbulb)\b",
+                   r"sun ?glasses|sunflower|flashlight|moon ?boot"),
+    "ruins":      (1200, r"\b(ruin|ruins|ruined|abandoned|crumbling|broken|destroyed|wreck|wreckage|shipwreck|aqueduct|colosseum|stonehenge|tomb|crypt|mausoleum|sarcophagus|catacomb|dolmen|cairn|altar|archway|gateway|ancient)\b",
+                   r"\b(coin|coins|phone|screen|glass|bottle)\b"),
+    "rooms":      (2500, r"\b(room|rooms|bedroom|kitchen|interior|hallway|corridor|staircase|stairs|stairway|fireplace|hearth|doorway|door|window|armchair|rocking chair|throne|bed|wardrobe|bookcase|bookshelf|grandfather clock|piano|bathtub|stove)\b",
+                   r"\b(car door|door handle|doorknob|window frame sticker|bed ?bug|flower ?bed)\b"),
+    "landscapes": (2000, r"\b(landscape|terrain|valley|forest|woods|desert|dune|dunes|meadow|beach|coast|coastline|shore|fjord|archipelago|plateau|ridge|gorge|ravine|oasis|swamp|marsh|jungle|hillside|floating island)\b",
+                   r"topographic|\bmap\b"),
+}
+# the base JUNK minus the setting words the extension is looking for
+JUNK_EXTRA = re.compile(r"\b(dew|bike|bicycle|tile|patch|text|logo|letter|letters|word|words|sign|card|poster|map|diagram|icon|emoji|texture|pattern|flag|painting|picture|photo|image|screen|number|alphabet)\b", re.I)
+ALL_FAMILIES = [*FAMILIES, *EXTRA_FAMILIES]
 
 
 def subject(caption: str) -> str:
@@ -120,7 +152,77 @@ def stage_index(args):
 
 
 # ------------------------------------------------------------------ select
+def manifest_row(uid, fam, caption, path, m):
+    return {"uid": uid, "family": fam, "caption": caption, "path": path, "license": m[0],
+            "mb": m[1], "name": m[3], "author": m[4], "url": m[5]}
+
+
+def stage_extend(args):
+    """Append EXTRA_FAMILIES to an existing manifest (never touches its rows, so
+    built shards, AE latents and quality rows keep their order)."""
+    dst = OUT_DIR / args.manifest
+    have = [json.loads(l) for l in open(dst, encoding="utf-8")]
+    done_fams = {r["family"] for r in have} & set(EXTRA_FAMILIES)
+    if done_fams:
+        print(f"{dst.name} already has {sorted(done_fams)}; nothing to do"); return
+    have_uids = {r["uid"] for r in have}
+    meta = json.load(gzip.open(OBJ_DIR / "meta_compact.json.gz", "rt", encoding="utf-8"))
+    paths = json.load(gzip.open(OBJ_DIR / "object-paths.json.gz"))
+    regs = {k: re.compile(r, re.I) for k, (_, r, _) in EXTRA_FAMILIES.items()}
+    excl = {k: re.compile(x, re.I) for k, (_, _, x) in EXTRA_FAMILIES.items()}
+    # family -> keyword -> [(uid, caption)]
+    cands = {k: {} for k in EXTRA_FAMILIES}
+    seen = set()
+    n_mood = 0
+    with open(OBJ_DIR / "cap3d.csv", encoding="utf-8", errors="replace") as f:
+        for uid, cap in csv.reader(f):
+            if len(uid) != 32 or uid in have_uids or uid in seen:
+                continue
+            m = meta.get(uid)
+            if not (m and uid in paths and m[0] in LICENSES and 0 < m[1] <= MAX_MB and m[2] <= MAX_FACES):
+                continue
+            seen.add(uid)
+            subj = subject(cap)
+            if JUNK_EXTRA.search(subj):
+                continue
+            for fam, rg in regs.items():
+                hit = rg.search(subj)
+                if hit and not excl[fam].search(cap):
+                    if MOOD.search(cap):
+                        n_mood += 1
+                    else:
+                        cands[fam].setdefault(hit.group(1).lower(), []).append((uid, cap))
+                    break
+    print(f"  dropped {n_mood} toy/cartoon matches")
+    rows = []
+    for fam, (quota, _, _) in EXTRA_FAMILIES.items():
+        by_kw = {kw: sorted(v, key=lambda x: hashlib.sha1(f"mimoid{x[0]}".encode()).hexdigest())
+                 for kw, v in sorted(cands[fam].items())}
+        take, mix = [], {}
+        depth = 0
+        while len(take) < quota and any(depth < len(v) for v in by_kw.values()):
+            for kw, v in by_kw.items():  # round-robin: every keyword's next form in turn
+                if depth < len(v) and len(take) < quota:
+                    take.append(v[depth])
+                    mix[kw] = mix.get(kw, 0) + 1
+            depth += 1
+        n_pool = sum(len(v) for v in by_kw.values())
+        print(f"  {fam:10s} {n_pool:6d} candidates -> {len(take):5d} ({sum(meta[u][1] for u, _ in take) / 1e3:.1f} GB) · "
+              + ", ".join(f"{kw} {n}" for kw, n in sorted(mix.items(), key=lambda x: -x[1])[:8]))
+        rows += [manifest_row(u, fam, cap, paths[u], meta[u]) for u, cap in take]
+    backup = dst.with_name(dst.stem + "_base.jsonl")
+    if not backup.exists():
+        backup.write_bytes(dst.read_bytes())
+    with open(dst, "a", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    print(f"manifest += {len(rows)} objects -> {dst} ({sum(r['mb'] for r in rows) / 1e3:.1f} GB to stream; "
+          f"original kept as {backup.name})")
+
+
 def stage_select(args):
+    if args.extend:
+        return stage_extend(args)
     meta = json.load(gzip.open(OBJ_DIR / "meta_compact.json.gz", "rt", encoding="utf-8"))
     paths = json.load(gzip.open(OBJ_DIR / "object-paths.json.gz"))
     lvis = json.load(gzip.open(OBJ_DIR / "lvis-annotations.json.gz"))
@@ -161,10 +263,7 @@ def stage_select(args):
         take = pool[: max(1, round(quota * scale))]
         mb = sum(meta[u][1] for u in take)
         print(f"  {fam:10s} {len(pool):6d} candidates -> {len(take):5d} ({mb / 1e3:.1f} GB)")
-        for u in take:
-            m = meta[u]
-            rows.append({"uid": u, "family": fam, "caption": captions[u], "path": paths[u], "license": m[0],
-                         "mb": m[1], "name": m[3], "author": m[4], "url": m[5]})
+        rows += [manifest_row(u, fam, captions[u], paths[u], meta[u]) for u in take]
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     dst = OUT_DIR / args.manifest
     with open(dst, "w", encoding="utf-8") as f:
@@ -240,20 +339,25 @@ def build_one(row):
     except Exception as e:  # noqa: BLE001
         return row["uid"], None, f"download: {type(e).__name__}", 0.0, 0.0
     t1 = time.time()
-    grid, why = mesh_to_grid(data)
+    try:
+        grid, why = mesh_to_grid(data)
+    except MemoryError:  # transient (other workers hold big grids too): retried on the next run
+        grid, why = None, "oom"
+    except Exception as e:  # noqa: BLE001 — one bad mesh must not stop the build
+        grid, why = None, f"error: {type(e).__name__}"
     return row["uid"], grid, why, t1 - t0, time.time() - t1
 
 
 def stage_build(args):
     rows = [json.loads(l) for l in open(OUT_DIR / args.manifest, encoding="utf-8")]
-    if args.limit:
-        rows = rows[: args.limit]
     tag = Path(args.manifest).stem
     log_path = OUT_DIR / f"{tag}.log.jsonl"
     done = set()
     if log_path.exists():
         done = {json.loads(l)["uid"] for l in open(log_path, encoding="utf-8")}
     todo = [r for r in rows if r["uid"] not in done]
+    if args.limit:  # the next N unbuilt rows (a smoke test of an extended manifest)
+        todo = todo[: args.limit]
     shard_idx = len(list(OUT_DIR.glob(f"{tag}_*.npz")))
     print(f"{len(rows)} in manifest · {len(done)} already done · {len(todo)} to build · {args.workers} workers", flush=True)
 
@@ -273,34 +377,45 @@ def stage_build(args):
 
     pending_log = []
     t0 = time.time()
-    n_ok = n_fail = 0
+    n_ok = n_fail = n_retry = 0
     dl_s = cv_s = 0.0
     mb = 0.0
-    by_uid = {r["uid"]: r for r in todo}
     with ProcessPoolExecutor(args.workers) as ex:
-        futs = [ex.submit(build_one, r) for r in todo]
-        for k, fut in enumerate(as_completed(futs)):
-            uid, grid, why, dt_dl, dt_cv = fut.result()
-            dl_s += dt_dl; cv_s += dt_cv; mb += by_uid[uid]["mb"]
-            pending_log.append({"uid": uid, "status": why})
-            if grid is not None:
-                buf_g.append(grid); buf_u.append(uid); n_ok += 1
-            else:
-                n_fail += 1
-            if len(buf_g) >= SHARD:
-                flush()
-            if (k + 1) % 25 == 0 or k + 1 == len(todo):
-                el = time.time() - t0
-                eta = el / (k + 1) * (len(todo) - k - 1) / 3600
-                print(f"  {k + 1}/{len(todo)} · ok {n_ok} fail {n_fail} · {mb / el:.1f} MB/s · "
-                      f"avg dl {dl_s / (k + 1):.1f}s conv {cv_s / (k + 1):.1f}s · eta {eta:.1f} h", flush=True)
-        flush()
+        futs = {ex.submit(build_one, r): r for r in todo}
+        try:
+            for k, fut in enumerate(as_completed(futs)):
+                row = futs[fut]
+                try:
+                    uid, grid, why, dt_dl, dt_cv = fut.result()
+                except BrokenProcessPool:
+                    raise  # a worker died: the rest can't run; buffered grids are saved below
+                except Exception as e:  # noqa: BLE001 — e.g. a result too big to pickle back
+                    uid, grid, why, dt_dl, dt_cv = row["uid"], None, f"error: {type(e).__name__}", 0.0, 0.0
+                dl_s += dt_dl; cv_s += dt_cv; mb += row["mb"]
+                if why == "oom":  # not logged, so a rerun tries it again
+                    n_retry += 1
+                else:
+                    pending_log.append({"uid": uid, "status": why})
+                if grid is not None:
+                    buf_g.append(grid); buf_u.append(uid); n_ok += 1
+                else:
+                    n_fail += 1
+                if len(buf_g) >= SHARD:
+                    flush()
+                if (k + 1) % 25 == 0 or k + 1 == len(todo):
+                    el = time.time() - t0
+                    eta = el / (k + 1) * (len(todo) - k - 1) / 3600
+                    print(f"  {k + 1}/{len(todo)} · ok {n_ok} fail {n_fail} · {mb / el:.1f} MB/s · "
+                          f"avg dl {dl_s / (k + 1):.1f}s conv {cv_s / (k + 1):.1f}s · eta {eta:.1f} h", flush=True)
+        finally:
+            flush()
     # failures carry no grid, so they may still be pending if the last shard was empty
     if pending_log:
         with open(log_path, "a", encoding="utf-8") as f:
             for rec in pending_log:
                 f.write(json.dumps(rec) + "\n")
-    print(f"build done: {n_ok} grids, {n_fail} skipped, {(time.time() - t0) / 60:.1f} min")
+    print(f"build done: {n_ok} grids, {n_fail} skipped ({n_retry} out of memory, retried next run), "
+          f"{(time.time() - t0) / 60:.1f} min")
 
 
 # ----------------------------------------------------------------- preview
@@ -356,29 +471,23 @@ def render_grids(grids: np.ndarray, size: int = 160, yaw: float = 0.6, pitch: fl
     return img.cpu().numpy()
 
 
-def load_library(tag: str):
-    grids, uids = [], []
-    for p in sorted(OUT_DIR.glob(f"{tag}_*.npz")):
-        z = np.load(p)
-        grids.append(z["grids"]); uids += list(z["uids"])
-    return (np.concatenate(grids) if grids else np.zeros((0, G, G, G), np.int8)), uids
-
-
 def stage_preview(args):
     sys.path.insert(0, str(ROOT / "scripts"))
     from imagination_corpus import write_png
 
+    from mimoid_train_ae import load_all  # the memmapped cache: the full library doesn't fit in RAM twice
+
     tag = Path(args.manifest).stem
     rows = {json.loads(l)["uid"]: json.loads(l) for l in open(OUT_DIR / args.manifest, encoding="utf-8")}
-    grids, uids = load_library(tag)
+    grids, uids = load_all(tag)
     print(f"{len(uids)} grids in library")
     PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
     fam_of = np.array([rows[u]["family"] for u in uids])
-    for fam in FAMILIES:
+    for fam in args.families.split(",") if args.families else ALL_FAMILIES:
         idx = np.where(fam_of == fam)[0][: args.per_family]
         if len(idx) == 0:
             continue
-        tiles = render_grids(grids[idx])
+        tiles = render_grids(np.asarray(grids[idx]))
         cols = 6
         pad = (-len(tiles)) % cols
         tiles = np.concatenate([tiles, np.zeros((pad,) + tiles.shape[1:], np.uint8)])
@@ -395,8 +504,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("stage", choices=["index", "select", "build", "preview"])
     ap.add_argument("--total", type=int, default=20500, help="select: library size")
+    ap.add_argument("--extend", action="store_true", help="select: append EXTRA_FAMILIES to the existing manifest")
     ap.add_argument("--manifest", default="library.jsonl")
-    ap.add_argument("--limit", type=int, default=0, help="build: only the first N rows")
+    ap.add_argument("--limit", type=int, default=0, help="build: only the next N unbuilt rows")
+    ap.add_argument("--families", default="", help="preview: comma-separated families (default all)")
     ap.add_argument("--workers", type=int, default=max(2, (os.cpu_count() or 4) - 2))
     ap.add_argument("--per-family", type=int, default=18)
     args = ap.parse_args()

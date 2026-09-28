@@ -322,15 +322,75 @@ house, 0.44) and "a rainstorm" (clouded mountains, umbrella, 0.45) never made th
 - Weak spot: atmosphere words ("a storm", "a dream", "fog") pass minSim on loose matches (red
   spiral, teddy bear). That's a library gap, not a picker one.
 
+## Library growth: settings + atmosphere (2026-09-27)
+Goal: give a scene thought's middle/shallow layers somewhere to go (weather, rooms, landscapes,
+ruins, light, water), in the mimoid feel, and drop what breaks it (toys, plushies, cartoons).
+- **Gap scan** (`scripts/mimoid_gaps.py`, 59 phrases, best kept caption cos): before growth,
+  weather 0.483 mean best (storm → mountains with clouds / a roaring lion, "lightning" → Lightning
+  McQueen), light 0.585 (sun 0.48, stars 0.44, torch 0.50), water 0.590 (wave 0.46, whirlpool 0.46),
+  ruins 0.629 (aqueduct 0.50), rooms 0.640 (library 0.44), landscapes 0.679 (canyon 0.53, coastline 0.52).
+- **Objaverse has almost no weather**: 346 licensed candidates, mostly clouds, snowflakes and
+  rainbows (point clouds, "rainbow-colored" things and water bottles are excluded per family).
+- `mimoid_data.py select --extend` appends `EXTRA_FAMILIES` to `library.jsonl` (the original rows are
+  byte-identical; a copy is kept as `library_base.jsonl`). Within a family the regex's matched keyword
+  is round-robined (5.8k staircases / 2k catalog desk lamps can't fill it; plain "lamp" is left out).
+  +8,699 objects, 36 GB to stream: weather 346, water 906, light 2000, ruins 947, rooms 2500, landscapes 2000.
+- **Mood filter** `mimoid_data.MOOD` (toy, plush, teddy, cartoon, lego, minecraft, pixelated, Pokémon,
+  Sonic, Mario, …; hot-air balloons pass): skipped at select, and a `mood` column in
+  `mimoid_quality.py` drops existing forms at export: 1,177 otherwise-kept forms, 14,898 → 13,721.
+- Pipeline for new grids (no retraining):
+  - `mimoid_encode.py` appends latents to `mimoid_grid.pt` with the encoder from `mimoid_grid_ckpt.pt`
+    (its decoder is bit-identical to the shipped one; it checks that re-encoding old forms reproduces
+    their latents; the original is kept as `mimoid_grid_base.pt`).
+  - `mimoid_quality.py` scores only rows it hasn't seen.
+  - `load_all` streams shards into the memmap: concatenating in RAM needed 2× the library, and 16 GB
+    doesn't fit that at 25k.
+- `mimoid_grow.py` runs the chain: build → encode → captions → quality (+sheet) → export → preview
+  sheets for the new families (`previews/mimoid/library_<family>.png`) → gaps → `walk_grown.png`.
+  Log: `data/mimoid/grow.log`.
+
+### First grow run (2026-09-27, 03:06–05:35): build crashed at 8,375 / 8,659
+A worker hit `MemoryError` in the EDT (10 workers × 253³ grids), and the exception killed the
+build, so the chain stopped before encode. The saved shards are intact; only the unflushed buffer
+was lost and gets rebuilt. Keep rates per family: weather 69%, water 93%, light 86%, ruins 90%,
+rooms 90%, landscapes 76% so far (mostly `flat`). 284 landscape objects left (20 built in a smoke test).
+`build` now survives this: an out-of-memory object is skipped and retried on the next run (not
+logged), any other worker exception is logged as that object's failure, and the buffered grids are
+flushed even on a crash. Rerun `mimoid_grow.py` to finish (build resumes).
+Cleanup: `library_all.npy` (4.55 GB) is stale (shard count changed); delete it before the rerun, or
+the rebuild (~7 GB) runs with both copies on disk.
+
+### Grow rerun results (2026-09-27, 19:11–19:32, all stages exit 0)
+- Build finished the last 284 (185 ok, 99 skipped, mostly flat landscapes). Encode: 7,365 new latents;
+  re-encoding stored forms matches to 0.0018. Library 25,992 grids.
+- Gap scan, mean best caption cos before → after: weather 0.483 → 0.621, light 0.585 → 0.795,
+  water 0.590 → 0.724, ruins 0.629 → 0.692, rooms 0.640 → 0.770, landscapes 0.679 → 0.738.
+  Still weak: fog 0.50, mist over the sea 0.46, whirlpool 0.46, cathedral light 0.56, stars 0.55,
+  a well 0.55, a canyon 0.57.
+- Walks (`walk_grown.png` vs `walk_scene.png`): scene thoughts now reach atmosphere on the shallow
+  layers (tea → rain cloud → kitchen → teapots; lighthouse in a storm → cloud/clouded mountain;
+  server room → rooms). Single-subject thoughts are unchanged.
+- Other families are on target by caption sample (lamps/candles/moons/planets, temples/arches/
+  amphorae, furniture, dioramas). **Weather was noisy**: `rainbow`/`rain`/`mist` pulled in ~20 My
+  Little Pony "Rainbow Dash" models, rain boots, soda/beer cans and rainbow cakes. Note: the
+  `preview --families` sheets draw from *all* built grids, not the kept ones.
+- `MOOD` extended (`mimoid_data.py`): my little pony, rainbow dash, no-face, Five Nights at Freddy's,
+  Mickey Mouse, transformers, ice cream, cake, candy, lollipop, sushi, skateboard, kite, soda, beer,
+  "can of", rain boots/jacket. Broad words (can, jacket, earring, logo) were left out: they hit good
+  forms (trash-can pillars, busts in jackets). Kept 18,748 → **18,532** (animals −78, mostly FNaF
+  and Mickey Mouse; weather 203 → 170). Re-exported; gap scores unchanged (the junk never won).
+  Scratchpad `kept_dump.py` (kept captions per family), `junk_try.py`, `mood_new.py`.
+- In the in-app browser the dream worker came up on **wasm ×4 this time: 7 forms in 2.0–2.7 s**.
+- **Load fix:** the encoder's 15 s watchdog (meant for a backend hanging in `InferenceSession.create`)
+  also timed the 23 MB download, so a cold/slow first load showed "model failed to load: wasm timed
+  out" (it happened on a cold dev server). `worker.ts` now posts `weights` after the fetch and
+  `model.ts` arms the watchdog only then. Tested with a 20 s artificial download delay: it loads.
+- Permalinks are base64 (`#t=YSByYWluYm93` = "a rainbow"); a plain-text `#t=` is ignored.
+
 ## Next steps
-1. **Grow the library** (the real limit on "does the form relate to my prompt": no ants, guitars
-   or anchors exist; for scene thoughts, weather/atmosphere forms in the mimoid feel: storms,
-   fog, rain, clouds, night). The AE doesn't need retraining: `mimoid_grid_ckpt.pt` has the encoder. Needs:
-   `select` with bigger quotas / new families (tools, instruments, insects, furniture), overnight
-   `build`, an encode-only script for new grids, then captions -> quality -> export. The browser cost
-   is 384 B/form for the index (latents stream / Range-fetch).
-2. Check whether wasm threads come up in real Chrome (they hung in the in-app browser); if they do,
-   dreams should drop to ~2–3 s.
+1. Remaining gaps are library gaps: fog/mist, stars, whirlpool, wells, canyons; also ants, guitars,
+   insects, tools. Another `select --extend` batch would reuse the same pipeline (`mimoid_grow.py`).
+2. Confirm wasm threads in real Chrome too (they came up in the in-app browser this session).
 3. The melt midpoint between dissimilar poses is a fused lump by design; aligning forms (principal
    axes / center of mass) before the lerp could make melts read as bodies turning into each other.
 4. Thin sheets (wings) show voxel stair-steps at 64³.

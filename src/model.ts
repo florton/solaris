@@ -60,15 +60,19 @@ function spawnAndLoad(
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
     let settled = false;
-    const cancelWatchdog = startWatchdog(GPU_TIMEOUT_MS, () => {
-      if (settled) return;
-      settled = true;
-      worker.terminate();
-      reject(new Error(`${backend} timed out`));
-    });
+    // armed once the weights are in: a slow connection is not a hung backend
+    let cancelWatchdog = () => {};
     worker.onmessage = (e) => {
       const m = e.data;
       if (m.type === 'status') onStatus(m.msg);
+      if (m.type === 'weights' && !settled) {
+        cancelWatchdog = startWatchdog(GPU_TIMEOUT_MS, () => {
+          if (settled) return;
+          settled = true;
+          worker.terminate();
+          reject(new Error(`${backend} timed out`));
+        });
+      }
       if (m.type === 'ready' && !settled) {
         settled = true;
         cancelWatchdog();

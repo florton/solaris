@@ -11,9 +11,12 @@
 #             (high = a diorama: small things standing on a big flat plate)
 #   iou       reconstruction IoU against the true grid (low = the AE broke it)
 #   scene     commas + " and " in the caption (multi-object scenes)
-# Writes data/mimoid_quality.npz; `--sheet` renders the worst of each metric.
+#   mood      1 if the caption is a toy / plushie / cartoon (mimoid_data.MOOD)
+# Writes data/mimoid_quality.npz; when the library has grown (mimoid_encode.py)
+# only the new rows are scored. `--sheet` renders the worst of each metric.
 # Run: .venv/Scripts/python scripts/mimoid_quality.py [--sheet]
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -22,7 +25,8 @@ import torch
 from scipy import ndimage
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mimoid_dream import Dreamer  # noqa: E402
+from mimoid_data import MOOD  # noqa: E402
+from mimoid_dream import CAPS, Dreamer  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "data" / "mimoid_quality.npz"
@@ -30,8 +34,8 @@ TRUTH = ROOT / "data" / "mimoid" / "library_all.npy"
 SHELL = 127 / 7 * 1.0  # int8 units of one voxel (TRUNC 0.2 ≈ 7 voxels)
 
 # a form is kept when all of these hold (see keep())
-LIMITS = {"main": 0.85, "flat": 0.12, "base": 0.4, "iou": 0.6, "scene": 4, "vol": 0.002}
-HIGH_IS_BAD = ("base", "scene")
+LIMITS = {"main": 0.85, "flat": 0.12, "base": 0.4, "iou": 0.6, "scene": 4, "vol": 0.002, "mood": 0}
+HIGH_IS_BAD = ("base", "scene", "mood")
 
 
 def keep(q) -> np.ndarray:
@@ -70,31 +74,40 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sheet", action="store_true")
     args = ap.parse_args()
-    if not OUT.exists():
+    q = dict(np.load(OUT)) if OUT.exists() else {}
+    n_old = len(q.get("vol", []))
+    caps = [str(c) for c in np.load(CAPS)["captions"]]
+    if n_old < len(caps):  # first pass, or the library grew: score the new rows only
         d = Dreamer("cuda" if torch.cuda.is_available() else "cpu")
         truth = np.load(TRUTH, mmap_mode="r")
         N = len(d.lat)
-        cols = {k: np.zeros(N, np.float32) for k in ("vol", "main", "flat", "shell", "iou")}
-        for i in range(0, N, 64):
+        if len(truth) != N or len(caps) != N:
+            raise SystemExit(f"out of step: {len(truth)} grids, {N} latents, {len(caps)} captions")
+        new = {k: np.zeros(N - n_old, np.float32) for k in ("vol", "main", "flat", "shell", "iou", "base")}
+        for i in range(n_old, N, 64):
             g = d.grids(d.lat[i:i + 64])
             for j, gj in enumerate(g):
-                for k, v in zip(cols, metrics(gj, truth[i + j])):
-                    cols[k][i + j] = v
-            if i % 1280 == 0:
+                for k, v in zip(new, (*metrics(gj, truth[i + j]), base_share(gj))):
+                    new[k][i - n_old + j] = v
+            if (i - n_old) % 1280 == 0:
                 print(f"  {i}/{N}", flush=True)
-        caps = [str(c) for c in d.captions]
-        cols["scene"] = np.array([c.count(",") + c.count(" and ") for c in caps], np.float32)
-        np.savez(OUT, **cols)
-    q = dict(np.load(OUT))
-    if "base" not in q:  # added after the first pass: decode-only, no truth needed
-        d = Dreamer("cuda" if torch.cuda.is_available() else "cpu")
-        q["base"] = np.array([base_share(g) for i in range(0, len(d.lat), 64) for g in d.grids(d.lat[i:i + 64])], np.float32)
-        np.savez(OUT, **q)
+        for k, v in new.items():
+            q[k] = np.concatenate([q[k], v]) if n_old else v
+    # caption metrics are cheap: always recomputed, so a new filter reaches old rows too
+    q["scene"] = np.array([c.count(",") + c.count(" and ") for c in caps], np.float32)
+    q["mood"] = np.array([bool(MOOD.search(c)) for c in caps], np.float32)
+    np.savez(OUT, **q)
     k = keep(q)
     print(f"{len(k)} forms, keep {k.sum()} ({k.mean():.1%})")
     for m, lim in LIMITS.items():
         bad = q[m] > lim if m in HIGH_IS_BAD else q[m] < lim
         print(f"  {m:6s} limit {lim}: fails {bad.sum():5d}  (p5 {np.percentile(q[m], 5):.3f}  p50 {np.median(q[m]):.3f}  p95 {np.percentile(q[m], 95):.3f})")
+    fam = {}
+    for line in open(ROOT / "data" / "mimoid" / "library.jsonl", encoding="utf-8"):
+        r = json.loads(line)
+        fam[r["uid"]] = r["family"]
+    fam_of = np.array([fam[str(u)] for u in np.load(CAPS)["uids"]])
+    print("  kept per family: " + " · ".join(f"{f} {k[fam_of == f].sum()}/{(fam_of == f).sum()}" for f in dict.fromkeys(fam_of)))
 
     if args.sheet:
         from imagination_corpus import write_png
