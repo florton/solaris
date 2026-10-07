@@ -387,9 +387,121 @@ the rebuild (~7 GB) runs with both copies on disk.
   `model.ts` arms the watchdog only then. Tested with a 20 s artificial download delay: it loads.
 - Permalinks are base64 (`#t=YSByYWluYm93` = "a rainbow"); a plain-text `#t=` is ignored.
 
+## No retraining needed (checked 2026-09-27)
+The browser ships only MiniLM (pretrained) and the frozen AE decoder. The AE reconstructs the new
+families as well as the ones it trained on (median recon IoU: weather 0.92, light 0.88, rooms 0.87,
+water 0.86, landscapes 0.83, ruins 0.82; old families 0.78–0.97). Scratchpad `iou_fam.py`.
+
+## Batch 2: tools, insects, instruments (prepared 2026-09-27, user runs it)
+- User: no thin tools (screws, screwdrivers…), only forms that come through. `EXTRA_FAMILIES` gained
+  `tools` (chunky only: anvils, vises, barrels, crates, chests, hammers, axes, pickaxes, gears, padlocks,
+  cauldrons, catapults, cannons, microscopes, typewriters, …; the exclude regex drops any caption
+  mentioning screws, screwdrivers, nails, bolts, wrenches, pliers, scissors, saws, chisels, drills,
+  keys, knives, guns), `insects` (Spider-Man, biplanes, jewellery excluded) and `instruments`.
+  2,900 objects, 10.6 GB (tools 1500, insects 800, instruments 600). `MOOD` += "pixel art".
+- `select --extend` now appends only the families the manifest lacks (it used to refuse once any
+  extension family was present); `--dry-run` writes the picks to `library_dryrun.jsonl` instead.
+- **Thickness gate considered and rejected.** `core(r)` = share of the solid surviving a morphological
+  opening by r voxels (scratchpad `thick_calib.py`, `thick.npz`). Objects are scaled to fill the
+  cube, so a lone screw is an ~11-voxel rod: screws core 0.98 / recon IoU 0.96, screwdrivers
+  0.88 / 0.93. What loses detail is thin *parts* next to big ones (lamp posts, swords, chair legs,
+  butterflies, rotors). But 31% of the library has core(1.5) < 0.3, including open-shell busts and masks
+  that render fine; within that band recon IoU is p50 0.72 and 16% fall under 0.6, which the existing
+  IoU ≥ 0.6 gate already removes. So keyword exclusion + the recon-IoU gate is the "comes through" check.
+- Run (disk had 25 GB free; the stale 6.8 GB `library_all.npy` is deleted first, since the rebuild writes a
+  .tmp next to it):
+  ```
+  cd C:\Users\17207\something\solaris; $env:PYTHONIOENCODING="utf-8"; .\.venv\Scripts\python.exe -u scripts\mimoid_data.py select --extend; if ($LASTEXITCODE -eq 0) { Remove-Item data\mimoid\library_all.npy; .\.venv\Scripts\python.exe -u scripts\mimoid_grow.py }
+  ```
+  Then check `grow.log`: kept per family for tools/insects/instruments, `previews/mimoid/library_{tools,insects,instruments}.png`
+  (these show all built grids, not only the kept ones).
+
+## v0.04 viewer fixes (2026-10-07, after v0.03 feedback)
+User: the tour switched too fast and needed more presets; the full form never showed; the layer dots
+should be clickable; forms should all start upright and facing the same way (free orbit stays);
+too many near-duplicates (cars).
+- **Whole forms**: the idle drift was a sinusoid along w with a ±0.4 rad tilt, so the slice never
+  rested on a layer. Now the idle drift walks the layers one at a time (`walk` in `main.ts`). It spends
+  `TOUR.layerMs` 2.8 s per layer, melting over ~1 s with the slice leaning into w (`walkTilt` 0.35),
+  then resting flat on the whole form. A new thought sweeps up to the deepest layer (closest match) and
+  walks 6 → 0 → 6.
+- Scroll snaps to the nearest layer `snapMs` 350 ms after the wheel stops; the arrow keys step one layer.
+  The gauge dots are buttons (`goToLayer`: that layer, untilted).
+- Tour: `holdMs` 12 s → 34 s (one full walk), 14 → 30 presets (16 new scene thoughts reaching the grown
+  families; scratchpad `preset_more.py` walked 24 candidates, dropped moon/astronaut/tortoise/iceberg/
+  wave/sunken ship/stone head).
+- **Duplicates** (scratchpad `dup_orient_scan.py` → `dup_clusters.png`): Objaverse has the same model
+  uploaded many times (one sports car ×8+, a tank, a van, a truck, 115 plain spheres). At latent cos > 0.95,
+  4.0% of kept forms were redundant: light 13%, vessels 12%, ruins 6%, vehicles 2.5%. `mimoid_quality.py`
+  now has a `dup` column (recomputed on every run, after the other limits): clusters at cos > `DUP_COS` 0.97
+  keep their best-IoU form. 670 dropped; kept 18,532 → **17,838** (24 more from "pixel art" in `MOOD`).
+  Re-exported. Old file: `data/mimoid_quality_predup.npz`. It only catches copies in the same orientation;
+  rerun it after the orientation pass to catch rotated copies too.
+- **Orientation (not done yet).** Grids keep each GLB's axes (glTF y-up, front +z). A random sample of 96
+  kept forms (`orient_sample.png`) is mostly upright, but some lie on their back or side (a face mask
+  facing up, a winged figure on its side), and the facing direction is arbitrary (cars point every way).
+  The user wants every form to *start* in the same orientation (upright, facing the viewer); free orbit stays.
+  Plan: render each kept form under the 24 axis-aligned rotations, score the renders with CLIP zero-shot
+  against the caption ("upright", "front view"), and only change a form when the margin over identity is
+  clear. Rotate the true grid (90° turns are exact index permutations on the centered 64³ grid), re-encode
+  it with the `mimoid_grid_ckpt.pt` encoder (as `mimoid_encode.py` does), then quality → export. No
+  retraining. Needs CLIP weights (not on this machine yet).
+
+## Batch 2 redone: a much wider object pool (2026-10-07, user runs it)
+User: cut down on tools, add a ton more objects and many more animals. It must *greatly* expand the
+pool; from testing, a coke/soda bottle, a teacup and an apple didn't come through.
+- Why: the library had no cups, mugs or apples at all and 1 teacup (the families never searched for
+  them), and `MOOD` dropped every "soda"/"beer"/"can of" caption. Penguins/zebras/kangaroos: 16/8/4 kept.
+- `MOOD` lost soda/beer/can of. `FAMILY_JUNK["weather"]` keeps them out of weather only (where rain/rainbow
+  keywords pulled in cans); `mimoid_quality.py` applies it per family.
+- Batch 2 (`EXTRA_FAMILIES`, the first family whose regex hits takes the object, so tableware and food
+  come before fauna). Dry run: **23,800 objects, 81 GB to stream**:
+  tableware 2000 (5.6k candidates), food 2500 (5.1k), fauna 6000 (13.3k), household 4000 (38k),
+  structures 2000 (3.3k), machines 2500 (12.9k), plants 1500 (4.7k), people 1500 (20k),
+  tools 400 (was 1500), insects 800, instruments 600. Caption samples checked; excludes added for
+  UFO/shampoo (tableware), knives/swords/playgrounds (people), VW Beetle/butterfly knife (insects),
+  drum-magazine guns (instruments).
+- Disk: 17 GB free before the run. Each GLB is deleted after its grid is built; `library_all.npy` grows from
+  6.8 to about 12 GB (the old one is deleted first). Browser: `library_lat.bin` goes from 27 MB to about 50 MB.
+- Run (user, overnight; about 7–9 h):
+  ```
+  cd C:\Users\17207\something\solaris; $env:PYTHONIOENCODING="utf-8"; .\.venv\Scripts\python.exe -u scripts\mimoid_data.py select --extend; if ($LASTEXITCODE -eq 0) { Remove-Item data\mimoid\library_all.npy; .\.venv\Scripts\python.exe -u scripts\mimoid_grow.py }
+  ```
+
+## Orientation pass (2026-10-07) — `scripts/mimoid_orient.py`
+- CLIP ViT-B/16 zero-shot (weights in the HF cache) was tested first: it picked the right up axis 45% of the
+  time and the facing 35%, at 2.2 s per form (scratchpad `orient_test.py`). Dropped.
+- A self-supervised 3D CNN (32³ pooled grid → 24 rotations, ~1.6M params) learns the library's majority
+  convention. Each form is scored under all 24 extra turns (voting). It is turned only if
+  P(best) − P(as is) > `--margin`. **The prototype was weak**: 12 min (1,205 steps, CPU-bound at ~1.7
+  steps/s) reached 35% up-axis accuracy on held-out turns (chance 17%), and voting was slow; the user
+  stopped it. It is not in the grow chain. No orientations were written, and the hooks below are no-ops
+  without `mimoid_orient.npz`.
+- Background: the build already uses each GLB's own orientation (trimesh applies the scene graph), and glTF
+  specifies +Y up and +Z front. Up is right for most forms (an estimated ~5–8% lie on their back or side in
+  a 96-form sample: Z-up exports). Facing is arbitrary: the spec's +Z front isn't followed in practice.
+- **User: only up matters, not facing.** Rewritten as an up-only net (`UpNet`, 16³ input, 1.9M params): a
+  random yaw, then one of 6 tilts → predict the tilt. Scoring undoes each tilt (× 4 yaws) and reads
+  P(upright). Data + rotations live on the GPU; 32³ was too slow (1.2 steps/s, ~25 min to score).
+  8-min test on 25,992 forms: held-out up axis 0.46 → 0.60 and still rising; scoring takes 3 min.
+  Forms that would be stood up: margin 0.5: 1,723 · 0.6: 1,134 · 0.7: 689 · 0.8: 319 · 0.9: 58.
+  `previews/mimoid_orient.png`: the most confident flips are right (upside-down buildings/vases/chandeliers/
+  mountains, lying rockets/bottles/lamps/busts), but around 0.5–0.75 about half are wrong (pianos and a
+  fireplace laid on their backs, a palm tree and a standing person flipped).
+- In tonight's chain as `mimoid_orient.py --minutes 40 --dry-run` (net + sheet + margin counts, nothing
+  written). After review: `mimoid_orient.py --reuse --margin <m>` → `mimoid_encode.py` → `mimoid_quality.py`
+  → `export_dream.py` (a few minutes). To undo, delete `data/mimoid_orient.npz` and rerun those three.
+- Fallback if the net stays unreliable: **Orient Anything** (2024; a DINOv2 model trained on canonically oriented Objaverse renders,
+  predicts azimuth/polar/roll from one image). Score a few renders per form → up + front. Needs its
+  weights (ViT-L ~1.2 GB) and a run measured in hours on the 1650. Awaiting the user's call.
+- Non-destructive: shards stay raw. `data/mimoid_orient.npz` maps uid → pose index (`ROTS`, raw → canonical).
+  `load_all` turns the cached grids in place (`meta["rot"]` in `library_all_uids.json` records the
+  current pose), `mimoid_encode.py` re-encodes turned rows (`rot` in `mimoid_grid.pt`), and
+  `mimoid_quality.py` rescores them (`q["rot"]`). A rerun trains on the turned library and composes its corrections.
+- `main.ts` `show()` resets yaw/pitch to the default view (0.6, 0.25) for every thought; orbiting stays free.
+
 ## Next steps
-1. Remaining gaps are library gaps: fog/mist, stars, whirlpool, wells, canyons; also ants, guitars,
-   insects, tools. Another `select --extend` batch would reuse the same pipeline (`mimoid_grow.py`).
+1. After batch 2: remaining library gaps are fog/mist, stars, whirlpool, wells, canyons.
 2. Confirm wasm threads in real Chrome too (they came up in the in-app browser this session).
 3. The melt midpoint between dissimilar poses is a fused lump by design; aligning forms (principal
    axes / center of mass) before the lerp could make melts read as bodies turning into each other.

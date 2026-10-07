@@ -136,13 +136,15 @@ def augment(x):
 
 
 def load_all(tag):
-    """All shards as one int8 array, cached as a .npy for fast restarts."""
+    """All shards as one int8 array, cached as a .npy for fast restarts, each
+    form turned to its canonical pose (data/mimoid_orient.npz, mimoid_orient.py)."""
     cache = OUT_DIR / f"{tag}_all.npy"
     uid_cache = OUT_DIR / f"{tag}_all_uids.json"
     n_shards = len(list(OUT_DIR.glob(f"{tag}_[0-9]*.npz")))
     if cache.exists() and uid_cache.exists():
         meta = json.loads(uid_cache.read_text())
         if meta["shards"] == n_shards:
+            orient_cache(cache, uid_cache, meta)
             return np.load(cache, mmap_mode="r"), meta["uids"]
     # stream shard by shard into the memmap: concatenating in RAM needs 2× the library (13 GB at 25k forms)
     shards = sorted(OUT_DIR.glob(f"{tag}_[0-9]*.npz"))
@@ -158,8 +160,41 @@ def load_all(tag):
     out.flush()
     del out
     os.replace(tmp, cache)
-    uid_cache.write_text(json.dumps({"shards": n_shards, "uids": uids}))
+    meta = {"shards": n_shards, "uids": uids, "rot": [0] * len(uids)}
+    uid_cache.write_text(json.dumps(meta))
+    orient_cache(cache, uid_cache, meta)
     return np.load(cache, mmap_mode="r"), uids
+
+
+def orient_cache(cache, uid_cache, meta):
+    """Turn the cached grids (in place) to the poses mimoid_orient.npz asks for;
+    meta["rot"] records what each row currently has (raw = 0)."""
+    from mimoid_orient import COMPOSE, INV, ORIENT, rotate
+    n = len(meta["uids"])
+    have = meta.setdefault("rot", [0] * n)
+    want = [0] * n
+    if ORIENT.exists():
+        o = np.load(ORIENT)
+        by_uid = dict(zip([str(u) for u in o["uids"]], o["rot"].tolist()))
+        want = [by_uid.get(u, 0) for u in meta["uids"]]
+    todo = [i for i in range(n) if want[i] != have[i]]
+    if not todo:
+        return
+    print(f"  turning {len(todo)} cached grids to their canonical pose", flush=True)
+    arr = np.load(cache, mmap_mode="r+")
+    for k, i in enumerate(todo):
+        arr[i] = rotate(np.asarray(arr[i]), COMPOSE[want[i], INV[have[i]]])
+        have[i] = want[i]
+        if (k + 1) % 2000 == 0 or k + 1 == len(todo):  # progress survives an interruption
+            arr.flush()
+            uid_cache.write_text(json.dumps(meta))
+    del arr
+
+
+def cache_rot(tag) -> np.ndarray:
+    """the pose index each cached row currently has (after load_all)"""
+    meta = json.loads((OUT_DIR / f"{tag}_all_uids.json").read_text())
+    return np.array(meta.get("rot", [0] * len(meta["uids"])))
 
 
 def sheet(tiles, cols):

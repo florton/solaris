@@ -93,10 +93,25 @@ body {
   transform: translateY(-50%);
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 0;
   align-items: center;
-  pointer-events: none;
   z-index: 4;
+}
+.gauge-hit {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 19px;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+}
+.gauge-hit:hover .gauge-dot,
+.gauge-hit:focus-visible .gauge-dot {
+  outline: 1px solid var(--holo);
+  outline-offset: 3px;
 }
 .gauge-dot {
   width: 5px;

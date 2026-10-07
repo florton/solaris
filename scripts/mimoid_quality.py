@@ -12,6 +12,9 @@
 #   iou       reconstruction IoU against the true grid (low = the AE broke it)
 #   scene     commas + " and " in the caption (multi-object scenes)
 #   mood      1 if the caption is a toy / plushie / cartoon (mimoid_data.MOOD)
+#   dup       1 if the form repeats the shape of a better form that passes the
+#             other limits (latent cos > DUP_COS; Objaverse has some models
+#             uploaded many times, e.g. one sports car ×8). Same orientation only.
 # Writes data/mimoid_quality.npz; when the library has grown (mimoid_encode.py)
 # only the new rows are scored. `--sheet` renders the worst of each metric.
 # Run: .venv/Scripts/python scripts/mimoid_quality.py [--sheet]
@@ -25,8 +28,9 @@ import torch
 from scipy import ndimage
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mimoid_data import MOOD  # noqa: E402
+from mimoid_data import FAMILY_JUNK, MOOD  # noqa: E402
 from mimoid_dream import CAPS, Dreamer  # noqa: E402
+from mimoid_train_ae import cache_rot  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "data" / "mimoid_quality.npz"
@@ -34,15 +38,53 @@ TRUTH = ROOT / "data" / "mimoid" / "library_all.npy"
 SHELL = 127 / 7 * 1.0  # int8 units of one voxel (TRUNC 0.2 ≈ 7 voxels)
 
 # a form is kept when all of these hold (see keep())
-LIMITS = {"main": 0.85, "flat": 0.12, "base": 0.4, "iou": 0.6, "scene": 4, "vol": 0.002, "mood": 0}
-HIGH_IS_BAD = ("base", "scene", "mood")
+LIMITS = {"main": 0.85, "flat": 0.12, "base": 0.4, "iou": 0.6, "scene": 4, "vol": 0.002, "mood": 0, "dup": 0}
+HIGH_IS_BAD = ("base", "scene", "mood", "dup")
+DUP_COS = 0.97
 
 
-def keep(q) -> np.ndarray:
+def keep(q, skip=()) -> np.ndarray:
     ok = np.ones(len(q["vol"]), bool)
     for m, lim in LIMITS.items():
-        ok &= q[m] <= lim if m in HIGH_IS_BAD else q[m] >= lim
+        if m not in skip:
+            ok &= q[m] <= lim if m in HIGH_IS_BAD else q[m] >= lim
     return ok
+
+
+def duplicates(q) -> np.ndarray:
+    """1 for each form that passes the other limits but repeats a better one's
+    shape: clusters of latent cos > DUP_COS (single linkage), each keeps its
+    best-reconstructed form."""
+    from mimoid_dream import AE
+    lat = torch.load(AE, weights_only=False)["latents"].float()
+    lat = (lat - lat.mean((0, 2, 3, 4), keepdim=True)) / lat.std((0, 2, 3, 4), keepdim=True).clamp(min=1e-3)
+    cand = np.nonzero(keep(q, skip=("dup",)))[0]
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    z = lat[torch.from_numpy(cand)].reshape(len(cand), -1).to(dev)
+    z = z / z.norm(dim=1, keepdim=True)
+    par = np.arange(len(cand))
+
+    def find(a):
+        while par[a] != a:
+            par[a] = par[par[a]]
+            a = par[a]
+        return a
+
+    for s in range(0, len(z), 2048):
+        c = z[s:s + 2048] @ z.T
+        ii, jj = torch.nonzero(c > DUP_COS, as_tuple=True)
+        for a, b in zip((ii + s).tolist(), jj.tolist()):
+            if a < b:
+                par[find(a)] = find(b)
+    best = {}
+    for i in range(len(cand)):
+        r = find(i)
+        if r not in best or q["iou"][cand[i]] > q["iou"][cand[best[r]]]:
+            best[r] = i
+    dup = np.zeros(len(q["vol"]), np.float32)
+    dup[cand] = 1
+    dup[cand[list(best.values())]] = 0
+    return dup
 
 
 def base_share(g: np.ndarray) -> float:
@@ -77,36 +119,43 @@ def main():
     q = dict(np.load(OUT)) if OUT.exists() else {}
     n_old = len(q.get("vol", []))
     caps = [str(c) for c in np.load(CAPS)["captions"]]
-    if n_old < len(caps):  # first pass, or the library grew: score the new rows only
+    rot = cache_rot("library")  # pose of each grid (mimoid_orient.py); base share depends on it
+    turned = np.nonzero(rot[:n_old] != q.get("rot", np.zeros(n_old, int))[:n_old])[0] if n_old else np.zeros(0, int)
+    if n_old < len(caps) or len(turned):  # first pass, the library grew, or forms were turned: score those rows only
         d = Dreamer("cuda" if torch.cuda.is_available() else "cpu")
         truth = np.load(TRUTH, mmap_mode="r")
         N = len(d.lat)
-        if len(truth) != N or len(caps) != N:
-            raise SystemExit(f"out of step: {len(truth)} grids, {N} latents, {len(caps)} captions")
-        new = {k: np.zeros(N - n_old, np.float32) for k in ("vol", "main", "flat", "shell", "iou", "base")}
-        for i in range(n_old, N, 64):
-            g = d.grids(d.lat[i:i + 64])
+        if len(truth) != N or len(caps) != N or len(rot) != N:
+            raise SystemExit(f"out of step: {len(truth)} grids, {N} latents, {len(caps)} captions, {len(rot)} poses")
+        for k in ("vol", "main", "flat", "shell", "iou", "base"):
+            q[k] = np.concatenate([q[k], np.zeros(N - n_old, np.float32)]) if n_old else np.zeros(N, np.float32)
+        rows = np.concatenate([turned, np.arange(n_old, N)])
+        print(f"  scoring {len(rows)} rows ({len(turned)} turned, {N - n_old} new)", flush=True)
+        for s in range(0, len(rows), 64):
+            idx = rows[s:s + 64]
+            g = d.grids(d.lat[idx])
             for j, gj in enumerate(g):
-                for k, v in zip(new, (*metrics(gj, truth[i + j]), base_share(gj))):
-                    new[k][i - n_old + j] = v
-            if (i - n_old) % 1280 == 0:
-                print(f"  {i}/{N}", flush=True)
-        for k, v in new.items():
-            q[k] = np.concatenate([q[k], v]) if n_old else v
+                for k, v in zip(("vol", "main", "flat", "shell", "iou", "base"), (*metrics(gj, truth[idx[j]]), base_share(gj))):
+                    q[k][idx[j]] = v
+            if s % 1280 == 0:
+                print(f"  {s}/{len(rows)}", flush=True)
+    q["rot"] = rot
     # caption metrics are cheap: always recomputed, so a new filter reaches old rows too
     q["scene"] = np.array([c.count(",") + c.count(" and ") for c in caps], np.float32)
-    q["mood"] = np.array([bool(MOOD.search(c)) for c in caps], np.float32)
+    fam = {}
+    for line in open(ROOT / "data" / "mimoid" / "library.jsonl", encoding="utf-8"):
+        r = json.loads(line)
+        fam[r["uid"]] = r["family"]
+    fam_of = np.array([fam[str(u)] for u in np.load(CAPS)["uids"]])
+    q["mood"] = np.array([bool(MOOD.search(c)) or bool(f in FAMILY_JUNK and FAMILY_JUNK[f].search(c))
+                          for c, f in zip(caps, fam_of)], np.float32)
+    q["dup"] = duplicates(q)  # after the others: a cluster's representative must pass them
     np.savez(OUT, **q)
     k = keep(q)
     print(f"{len(k)} forms, keep {k.sum()} ({k.mean():.1%})")
     for m, lim in LIMITS.items():
         bad = q[m] > lim if m in HIGH_IS_BAD else q[m] < lim
         print(f"  {m:6s} limit {lim}: fails {bad.sum():5d}  (p5 {np.percentile(q[m], 5):.3f}  p50 {np.median(q[m]):.3f}  p95 {np.percentile(q[m], 95):.3f})")
-    fam = {}
-    for line in open(ROOT / "data" / "mimoid" / "library.jsonl", encoding="utf-8"):
-        r = json.loads(line)
-        fam[r["uid"]] = r["family"]
-    fam_of = np.array([fam[str(u)] for u in np.load(CAPS)["uids"]])
     print("  kept per family: " + " · ".join(f"{f} {k[fam_of == f].sum()}/{(fam_of == f).sum()}" for f in dict.fromkeys(fam_of)))
 
     if args.sheet:

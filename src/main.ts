@@ -27,7 +27,19 @@ let focusTarget = 0;
 let tiltTarget = 0; // x-w tilt of the slicing hyperplane (renderer.rotXW eases to it)
 const clampTilt = (a: number) => Math.max(-0.7, Math.min(0.7, a));
 let lastInteract = 0;
+let lastWheel = 0; // a scroll snaps to the nearest layer once it settles
 let fps = 60;
+
+// the layer axis: layer l of L sits at w = layerW(l); the full form of a layer
+// only shows when the slice rests exactly there, untilted
+const nLayersNow = () => sculpture?.nLayers ?? 7;
+const layerW = (l: number) => (nLayersNow() <= 1 ? 0 : (l / (nLayersNow() - 1)) * 2 - 1) * W_SPAN;
+const nearestLayer = (w: number) =>
+  Math.round(Math.max(0, Math.min(1, (w / W_SPAN + 1) / 2)) * (nLayersNow() - 1));
+
+// idle: walk the layers one at a time, resting on each (flat slice, whole
+// form), melting to the next with the slice leaning into the direction of travel
+const walk = { layer: 6, dir: -1, next: 0, idle: false };
 
 /** A thought, encoded, with its dream arriving layer by layer. */
 interface Prepared {
@@ -95,11 +107,20 @@ function show(p: Prepared, permalink: boolean): void {
   sculpture = buildSculpture(p.result);
   renderer.resetVolumes();
   renderer.setSculpture(sculpture);
-  // the sculpture *appears*: sweep up the layer axis from below the stack
+  // the sculpture *appears*: sweep up the layer axis from below the stack to
+  // the deepest layer (the thought's closest match), where the walk starts
   renderer.focus = -(W_SPAN + 0.6);
-  focusTarget = 0;
+  walk.layer = sculpture.nLayers - 1;
+  walk.dir = -1;
+  walk.next = 0;
+  focusTarget = layerW(walk.layer);
+  tiltTarget = 0;
+  // every thought starts from the same view (the library's forms are turned to
+  // +y up, front toward +z: scripts/mimoid_orient.py); orbiting stays free
+  renderer.yaw = 0.6;
+  renderer.pitch = 0.25;
   renderer.render();
-  ui.buildGauge(sculpture.nLayers);
+  ui.buildGauge(sculpture.nLayers, goToLayer);
   shownAt = performance.now();
   condensedAt = 0;
   if (model.dream) {
@@ -303,15 +324,19 @@ function wireInteraction(): void {
     (e) => {
       // (shift turns the wheel sideways in some browsers: deltaX)
       if (e.shiftKey) tiltTarget = clampTilt(tiltTarget + (e.deltaY || e.deltaX) * 0.0012);
-      else focusTarget = Math.max(-W_SPAN - 0.4, Math.min(W_SPAN + 0.4, focusTarget + e.deltaY * 0.0016));
+      else {
+        focusTarget = Math.max(-W_SPAN - 0.4, Math.min(W_SPAN + 0.4, focusTarget + e.deltaY * 0.0016));
+        lastWheel = performance.now();
+      }
       lastInteract = performance.now();
     },
     { passive: true },
   );
   window.addEventListener('keydown', (e) => {
     if (e.target instanceof HTMLInputElement) return;
-    if (e.key === 'ArrowDown' || e.key === 'ArrowRight') focusTarget = Math.min(W_SPAN + 0.4, focusTarget + 0.22);
-    if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') focusTarget = Math.max(-W_SPAN - 0.4, focusTarget - 0.22);
+    // arrows step one whole layer
+    if (e.key === 'ArrowDown' || e.key === 'ArrowRight') goToLayer(Math.min(nLayersNow() - 1, nearestLayer(focusTarget) + 1));
+    if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') goToLayer(Math.max(0, nearestLayer(focusTarget) - 1));
     if (e.key === '[') tiltTarget = clampTilt(tiltTarget - 0.1);
     if (e.key === ']') tiltTarget = clampTilt(tiltTarget + 0.1);
     if (e.key === '0') tiltTarget = 0;
@@ -354,14 +379,44 @@ function updateStats(): void {
   });
 }
 
+/** Rest the slice on layer l (a gauge dot, an arrow key): whole form, untilted. */
+function goToLayer(l: number): void {
+  focusTarget = layerW(l);
+  tiltTarget = 0;
+  walk.layer = l;
+  lastWheel = 0;
+  lastInteract = performance.now();
+}
+
 let lastFrame = 0;
 function frame(now: number): void {
   const idle = now - lastInteract > 3000;
+  // a scroll that has settled snaps to the nearest layer
+  if (lastWheel && now - lastWheel > TOUR.snapMs) {
+    focusTarget = layerW(nearestLayer(focusTarget));
+    lastWheel = 0;
+  }
   if (idle) {
     renderer.yaw += 0.00022; // glacial rotation
-    focusTarget = Math.sin(now * 0.00011) * (W_SPAN + 0.2); // slow drift along w
-    tiltTarget = Math.sin(now * 0.000043) * 0.4; // ...and the slice slowly tilting into it
+    const L = nLayersNow();
+    if (!walk.idle) {
+      // pick the walk up wherever the viewer left the slice
+      walk.layer = nearestLayer(focusTarget);
+      walk.next = now + TOUR.layerMs;
+    }
+    // hold still until the form has condensed
+    if (renderer.matTarget === 0) walk.next = Math.max(walk.next, now + TOUR.layerMs);
+    if (L > 1 && now > walk.next) {
+      if (walk.layer + walk.dir < 0 || walk.layer + walk.dir > L - 1) walk.dir = -walk.dir;
+      walk.layer += walk.dir;
+      walk.next = now + TOUR.layerMs;
+    }
+    focusTarget = layerW(walk.layer);
+    // lean into the move while melting, flat again on arrival
+    const step = (2 * W_SPAN) / Math.max(1, L - 1);
+    tiltTarget = TOUR.walkTilt * walk.dir * Math.min(1, Math.abs(focusTarget - renderer.focus) / step);
   }
+  walk.idle = idle;
   maybeCondense(performance.now());
   renderer.focus += (focusTarget - renderer.focus) * 0.08;
   renderer.rotXW += (tiltTarget - renderer.rotXW) * 0.06;

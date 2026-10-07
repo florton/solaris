@@ -70,13 +70,21 @@ export class UI {
       (s.offline ? `\n${s.offline}` : '');
   }
 
-  buildGauge(nLayers: number): void {
+  buildGauge(nLayers: number, onPick: (layer: number) => void): void {
     this.gauge.replaceChildren();
     this.gaugeDots = [];
     for (let i = 0; i < nLayers; i++) {
+      // the visible dot sits inside a larger hit area
+      const hit = document.createElement('button');
+      hit.className = 'gauge-hit';
+      hit.type = 'button';
+      hit.title = `layer ${i}`;
+      hit.setAttribute('aria-label', `show layer ${i}`);
+      hit.addEventListener('click', () => onPick(i));
       const dot = document.createElement('div');
       dot.className = 'gauge-dot';
-      this.gauge.appendChild(dot);
+      hit.appendChild(dot);
+      this.gauge.appendChild(hit);
       this.gaugeDots.push(dot);
     }
   }

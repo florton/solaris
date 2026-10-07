@@ -1,5 +1,6 @@
 # Overnight library growth after `mimoid_data.py select --extend`: build the
-# new grids, encode them with the trained AE, re-embed captions, score quality,
+# new grids, encode them with the trained
+# AE, re-embed captions, score quality (+ duplicates),
 # export for the browser, then render review sheets. Each step's output goes to
 # the log; the chain stops at the first failure and is safe to rerun (build
 # resumes, encode/quality only touch rows they haven't seen).
@@ -12,7 +13,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-EXTRA = "weather,water,light,ruins,rooms,landscapes"
+EXTRA = "tableware,food,fauna,household,structures,machines,plants,people,tools,insects,instruments"  # the batch being grown (review sheets only)
 
 
 def main():
@@ -23,6 +24,7 @@ def main():
     build = ["mimoid_data.py", "build"] + (["--limit", str(args.limit)] if args.limit else [])
     steps = [
         build,
+        ["mimoid_orient.py", "--minutes", "40", "--dry-run"],  # up-orientation net + review sheet only; apply after review
         ["mimoid_encode.py"],
         ["mimoid_captions.py"],
         ["mimoid_quality.py", "--sheet"],

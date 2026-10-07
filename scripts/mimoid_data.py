@@ -5,7 +5,7 @@
 #   select   bucket Cap3D captions (+ LVIS labels) into families, filter to
 #            commercial-friendly licenses (CC-BY / CC-BY-SA / CC0) and bounded
 #            file sizes, fill per-family quotas deterministically;
-#            --extend appends the settings/atmosphere families instead
+#            --extend appends the EXTRA_FAMILIES the manifest lacks instead
 #   build    stream each GLB, convert to a 64³ truncated SDF (int8), delete the
 #            GLB; resumable, sharded
 #   preview  render a contact sheet per family (GPU sphere tracing)
@@ -86,9 +86,12 @@ JUNK = re.compile(r"\b(kitchen|dew|bike|bicycle|terrain|landscape|tile|ground|fl
 # (also drops existing library forms at export, via mimoid_quality.py)
 MOOD = re.compile(r"\b(toy|toys|plush\w*|stuffed|teddy|lego|chibi|kawaii|funko|pok[eé]mon|pikachu|minecraft|smiley|"
                   r"cartoon\w*|doll|dolls|keychain|keyring|pinata|disney|pixar|anime|mcqueen|mario|sonic|spongebob|"
-                  r"pixelated|my little pony|rainbow dash|no[- ]face|spirited away|five nights at freddy'?s|mickey mouse|"
-                  r"transformers|ice cream|cakes?|cupcakes?|lollipops?|candy|sushi|skateboards?|kites?|soda|beer|can of|"
+                  r"pixelated|pixel art|my little pony|rainbow dash|no[- ]face|spirited away|five nights at freddy'?s|mickey mouse|"
+                  r"transformers|ice cream|cakes?|cupcakes?|lollipops?|candy|sushi|skateboards?|kites?|"
                   r"rain ?boots?|rubber boots?|gumboots?|rain ?jacket|raincoat)\b|(?<!hot air )(?<!hot-air )\bballoons?\b", re.I)
+# junk for one family only: weather's rain/rainbow keywords pulled in soda and
+# beer cans, which are fine forms anywhere else (a coke bottle is tableware)
+FAMILY_JUNK = {"weather": re.compile(r"\b(soda|beer|can of|cans?)\b", re.I)}
 
 # `select --extend`: settings and atmosphere, so a scene thought's middle and
 # shallow layers have somewhere to go ("tea in grandmas kitchen during a
@@ -108,6 +111,35 @@ EXTRA_FAMILIES = {
                    r"\b(car door|door handle|doorknob|window frame sticker|bed ?bug|flower ?bed)\b"),
     "landscapes": (2000, r"\b(landscape|terrain|valley|forest|woods|desert|dune|dunes|meadow|beach|coast|coastline|shore|fjord|archipelago|plateau|ridge|gorge|ravine|oasis|swamp|marsh|jungle|hillside|floating island)\b",
                    r"topographic|\bmap\b"),
+    # batch 2: a much wider object pool (the user found the library thin: no cups,
+    # mugs or apples at all, one teacup, 8-16 penguins/zebras/kangaroos). The first
+    # family whose regex hits a caption's subject takes it, so the specific ones
+    # (tableware, food) come before fauna: "a cat-shaped mug" is a mug.
+    "tableware":   (2000, r"\b(cup|cups|teacup|teacups|tea cup|coffee cup|mug|mugs|tankard|stein|bottle|bottles|soda bottle|coke|coca[- ]cola|pepsi|soda can|tin can|wine glass|wine bottle|champagne|goblets?|tumbler|pitcher|carafe|decanter|flask|canteen|thermos|kettle|saucer|cocktail|milkshake|coffee maker|espresso|teapot set)\b",
+                    r"\b(cupboard|cup holder|world cup|bra|buttercup|hiccup|bottle ?(cap|opener)|bottlebrush|gas bottle|spray bottle|sauce|perfume|shampoo|conditioner|lotion|flying saucer|ufo)\b"),
+    "food":        (2500, r"\b(apple|apples|pear|pears|banana|bananas|orange|oranges|lemon|lemons|lime|peach|plum|cherry|cherries|strawberry|strawberries|grapes|watermelon|melon|pineapple|coconut|avocado|mango|kiwi|pomegranate|fig|pumpkin|pumpkins|gourd|squash|tomato|tomatoes|potato|potatoes|carrot|carrots|eggplant|aubergine|bell pepper|onion|garlic|corn|broccoli|cauliflower|cabbage|radish|turnip|beet|bread|loaf|baguette|croissant|pretzel|bagel|donut|doughnut|muffin|pie|burger|hamburger|sandwich|hot dog|taco|burrito|cheese|egg|eggs|walnut|acorn|chestnut|peanut|fruit|fruits|vegetable|vegetables|steak|drumstick|sausage|ham)\b",
+                    r"apple (watch|logo|airpods|tv)|iphone|ipad|macbook|orange (shirt|car|light|color|colored|and)|\begg ?(shaped|-shaped|chair|timer|carton)|easter|cheese ?grater|ham radio|corn ?(field|ers?)|cornice|pie chart|\b(figs?\.|fig\b\s*\d)|peach (colou?red)|lime ?stone|squash (court|racket)|bread ?board"),
+    "fauna":       (6000, r"\b(dog|dogs|puppy|cat|cats|kitten|horse|horses|pony|donkey|zebra|lion|lioness|tiger|leopard|cheetah|jaguar|panther|lynx|elephant|mammoth|rhino|rhinoceros|hippo|hippopotamus|giraffe|camel|llama|alpaca|cow|bull|ox|yak|bison|buffalo|pig|boar|warthog|sheep|lamb|ram|goat|deer|moose|elk|reindeer|antelope|gazelle|kangaroo|koala|panda|bear|polar bear|wolf|fox|hyena|raccoon|badger|otter|beaver|hedgehog|porcupine|sloth|armadillo|anteater|squirrel|chipmunk|hamster|mouse|rat|rabbit|bunny|hare|bat|monkey|gorilla|chimpanzee|orangutan|lemur|bird|birds|owl|eagle|hawk|falcon|vulture|raven|crow|parrot|macaw|toucan|flamingo|pelican|swan|duck|goose|chicken|hen|rooster|turkey|peacock|penguin|ostrich|pigeon|dove|seagull|hummingbird|sparrow|woodpecker|whale|orca|dolphin|shark|seal|walrus|sea lion|manatee|fish|goldfish|koi|salmon|tuna|piranha|pufferfish|angelfish|swordfish|stingray|manta ray|eel|seahorse|jellyfish|octopus|squid|lobster|crab|shrimp|starfish|turtle|tortoise|lizard|iguana|chameleon|gecko|crocodile|alligator|snake|cobra|python|frog|toad|salamander|axolotl|dinosaur|t-rex|tyrannosaurus|triceratops|stegosaurus|velociraptor|raptor|brachiosaurus|pterodactyl|spinosaurus|ankylosaurus)\b",
+                    r"\b(hot dog|catwalk|bulldozer|ram (memory|stick)|mouse (pad|cursor)|computer mouse|gaming mouse|dog ?tag|fish ?(tank|bowl|hook|ing rod)|bat(ter|tery|man)|seal (stamp|ring)|crab ?claw machine|eagle (emblem|logo|badge))\b"),
+    "household":   (4000, r"\b(clock|alarm clock|wall clock|pocket watch|radio|television|tv|old tv|computer|monitor|camera|telephone|rotary phone|phone booth|microphone|headphones|speaker|loudspeaker|jukebox|record player|projector|toaster|microwave|blender|mixer|refrigerator|fridge|washing machine|stove|oven|fan|vacuum cleaner|iron|sewing machine|mailbox|trash can|garbage can|bin|basket|suitcase|backpack|handbag|purse|briefcase|shoe|shoes|sneaker|sneakers|boot|boots|high heel|hat|top hat|cowboy hat|crown|tiara|helmet|armor|armour|shield|trophy|globe|book|books|chess piece|chess set|king chess|rook|dice|birdcage|cage|lamp|desk lamp|table lamp|lampshade|chair|stool|bench|sofa|couch|table|desk|cabinet|dresser|drawer|nightstand|mirror|umbrella|fire hydrant|traffic cone|vending machine|arcade machine|piggy bank|robot|statuette|bust stand|safe|vault|box|jewelry box|music box|treasure box|gift box)\b",
+                    r"\b(text ?box|box ?(shaped|-shaped)|cardboard box|boxing|bounding box|sandbox|skybox|lightbox|xbox|blackbox|hitbox|robot ?(arm|vacuum)|bin ?(bag|liner)|shoe ?(lace|horn|print)|shield ?(icon|logo|badge|emblem)|book ?(cover|page|mark)|hat ?(pin|tip)|table ?(cloth|top|tennis|spoon)|monitor (lizard|stand)|fan (art|club)|iron (man|maiden|ore|bar|gate|fence)|safe ?(pin|zone))\b"),
+    "structures":  (2000, r"\b(windmill|windmills|barn|cottage|cabin|hut|shack|shed|farmhouse|skyscraper|skyscrapers|gazebo|pavilion|pagoda|stupa|igloo|tent|yurt|teepee|tipi|treehouse|bunker|silo|water tower|clock tower|bell tower|watchtower|minaret|fort|fortress|citadel|keep|town hall|chapel|monastery|observatory|planetarium|stadium|arena|amphitheater|greenhouse|kiosk|well|lighthouse|eiffel tower|big ben|statue of liberty|taj mahal|leaning tower)\b",
+                    r"\b(keep ?(calm|out)|well[- ](lit|done|known|being|dressed|built|defined|made)|as well|tent ?(peg|pole)|fort ?nite|fortnite)\b"),
+    "machines":    (2500, r"\b(airplane|aeroplane|plane|airliner|jet|fighter jet|biplane|glider|seaplane|helicopter|blimp|zeppelin|airship|hot air balloon|rocket|space shuttle|satellite|space station|lunar lander|rover|spaceship|ufo|ship|boat|sailboat|sailing ship|galleon|yacht|canoe|kayak|rowboat|gondola|ferry|tugboat|steamboat|battleship|aircraft carrier|submarine|train|locomotive|steam locomotive|tram|trolley|cable car|carriage|stagecoach|wagon|cart|chariot|car|cars|sports car|race car|vintage car|truck|fire truck|ambulance|police car|taxi|bus|school bus|double-decker|van|jeep|tractor|excavator|bulldozer|crane|forklift|steamroller|road roller|dump truck|cement mixer|tank|armored car|motorcycle|scooter|snowmobile|golf cart|mech)\b",
+                    r"\b(plane ?(geometry|surface|crash)|ground plane|plane (with|of) (text|logo)|jet ?ski|ship ?(in a bottle)|cart ?(oon|ridge)|car (key|seat|door|wheel|tire|tyre|battery|engine|logo|part)|shopping cart|tank ?top|fish tank|water tank|gas tank|fuel tank|crane fly|trolley ?(bag|case)|van (gogh))\b"),
+    "plants":      (1500, r"\b(tree|trees|oak|pine|pine tree|palm tree|palm|willow|birch|maple|cypress|baobab|sequoia|bonsai|bush|shrub|hedge|potted plant|houseplant|plant pot|flower pot|planter|cactus|succulent|aloe|fern|bamboo|sunflower|rose|tulip|lily|lotus|orchid|daisy|bouquet|tree stump|stump|log|logs|pinecone|pine cone|vine|ivy)\b",
+                    r"\b(family tree|tree ?(diagram|chart|house)|log ?(in|o|book)|palm (of|reading|hand)|rose ?(gold|window)|lily ?pad|hedgehog|log ?cabin)\b"),
+    "people":      (1500, r"\b(astronaut|astronauts|knight|knights|soldier|soldiers|samurai|ninja|warrior|viking|gladiator|spartan|pirate|cowboy|king|queen|prince|princess|wizard|witch|monk|nun|priest|pharaoh|dancer|ballerina|athlete|runner|boxer|diver|firefighter|fireman|policeman|doctor|chef|farmer|fisherman|sailor|old man|old woman|man|woman|men|women|boy|girl|child|children|person|people|figure|scarecrow|mannequin)\b",
+                    r"\b(man ?(hole|go|sion|tle)|woman's (head|face)|man's (head|face)|king ?(size|bed|crab)|queen ?(size|bed)|chess|figure ?(skating|eight|8|head)|stick figure|people (icon|logo)|head|face|bust|skull|knife|knives|swords?|blade|katana|playground)\b"),
+    # trimmed: chunky tools only (anvils, barrels, hammers, gears, machines);
+    # screws, screwdrivers, nails, pliers, saws and the like are excluded on sight
+    # (the whole caption, so "a toolbox with a screwdriver" is out too).
+    "tools":       (400, r"\b(anvil|anvils|vise|vice|grindstone|whetstone|millstone|sledgehammer|mallet|hammer|axe|hatchet|pickaxe|toolbox|tool chest|padlock|bellows|cauldron|kettle|bucket|barrel|barrels|crate|crates|treasure chest|wooden chest|wheelbarrow|gear|gears|cogwheel|cog|pulley|spinning wheel|sewing machine|typewriter|gramophone|phonograph|microscope|telescope|lawn mower|cannon|catapult|steam engine|lathe|blowtorch|oil can|jerrycan|fire extinguisher|hourglass)\b",
+                    r"hourglass-shaped|\b(screws?|screwdrivers?|nails?|bolts?|wrench(es)?|spanners?|pliers|scissors|saws?|chisels?|drills?|tongs|crowbars?|trowels?|rakes?|shovels?|keys?|needles?|pins?|knife|knives|rifles?|guns?|launcher|chest of drawers|gear ?shift|landing gear)\b"),
+    "insects":     (800, r"\b(ant|ants|beetle|beetles|spider|spiders|scorpion|snail|snails|bee|bees|wasp|butterfly|moth|ladybug|ladybird|dragonfly|grasshopper|mantis|cicada|caterpillar|centipede|insect|insects|beehive)\b",
+                    r"spider-?man|tiger moth|biplane|mantis shrimp|earrings?|necklace|pendant|brooch|volkswagen|\bvw\b|butterfly (knife|valve)"),
+    "instruments": (600, r"\b(guitar|violin|cello|double bass|drum|drums|harp|trumpet|trombone|tuba|saxophone|french horn|accordion|banjo|lute|ukulele|flute|xylophone|gong|bagpipes|sitar|metronome)\b",
+                    r"earrings?|necklace|pendant|brooch|guitar pick|drum ?sticks?|oil drum|drum brake|magazine|\bguns?\b|rifle"),
 }
 # the base JUNK minus the setting words the extension is looking for
 JUNK_EXTRA = re.compile(r"\b(dew|bike|bicycle|tile|patch|text|logo|letter|letters|word|words|sign|card|poster|map|diagram|icon|emoji|texture|pattern|flag|painting|picture|photo|image|screen|number|alphabet)\b", re.I)
@@ -158,20 +190,21 @@ def manifest_row(uid, fam, caption, path, m):
 
 
 def stage_extend(args):
-    """Append EXTRA_FAMILIES to an existing manifest (never touches its rows, so
-    built shards, AE latents and quality rows keep their order)."""
+    """Append the EXTRA_FAMILIES the manifest doesn't have yet (never touches its
+    rows, so built shards, AE latents and quality rows keep their order)."""
     dst = OUT_DIR / args.manifest
     have = [json.loads(l) for l in open(dst, encoding="utf-8")]
-    done_fams = {r["family"] for r in have} & set(EXTRA_FAMILIES)
-    if done_fams:
-        print(f"{dst.name} already has {sorted(done_fams)}; nothing to do"); return
+    pending = {k: v for k, v in EXTRA_FAMILIES.items() if k not in {r["family"] for r in have}}
+    if not pending:
+        print(f"{dst.name} already has every extra family; nothing to do"); return
+    print(f"  appending {', '.join(pending)}" + (" (dry run)" if args.dry_run else ""))
     have_uids = {r["uid"] for r in have}
     meta = json.load(gzip.open(OBJ_DIR / "meta_compact.json.gz", "rt", encoding="utf-8"))
     paths = json.load(gzip.open(OBJ_DIR / "object-paths.json.gz"))
-    regs = {k: re.compile(r, re.I) for k, (_, r, _) in EXTRA_FAMILIES.items()}
-    excl = {k: re.compile(x, re.I) for k, (_, _, x) in EXTRA_FAMILIES.items()}
+    regs = {k: re.compile(r, re.I) for k, (_, r, _) in pending.items()}
+    excl = {k: re.compile(x, re.I) for k, (_, _, x) in pending.items()}
     # family -> keyword -> [(uid, caption)]
-    cands = {k: {} for k in EXTRA_FAMILIES}
+    cands = {k: {} for k in pending}
     seen = set()
     n_mood = 0
     with open(OBJ_DIR / "cap3d.csv", encoding="utf-8", errors="replace") as f:
@@ -195,7 +228,7 @@ def stage_extend(args):
                     break
     print(f"  dropped {n_mood} toy/cartoon matches")
     rows = []
-    for fam, (quota, _, _) in EXTRA_FAMILIES.items():
+    for fam, (quota, _, _) in pending.items():
         by_kw = {kw: sorted(v, key=lambda x: hashlib.sha1(f"mimoid{x[0]}".encode()).hexdigest())
                  for kw, v in sorted(cands[fam].items())}
         take, mix = [], {}
@@ -210,6 +243,13 @@ def stage_extend(args):
         print(f"  {fam:10s} {n_pool:6d} candidates -> {len(take):5d} ({sum(meta[u][1] for u, _ in take) / 1e3:.1f} GB) · "
               + ", ".join(f"{kw} {n}" for kw, n in sorted(mix.items(), key=lambda x: -x[1])[:8]))
         rows += [manifest_row(u, fam, cap, paths[u], meta[u]) for u, cap in take]
+    if args.dry_run:
+        side = dst.with_name(dst.stem + "_dryrun.jsonl")
+        with open(side, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        print(f"dry run: would append {len(rows)} objects ({sum(r['mb'] for r in rows) / 1e3:.1f} GB to stream) -> {side.name}")
+        return
     backup = dst.with_name(dst.stem + "_base.jsonl")
     if not backup.exists():
         backup.write_bytes(dst.read_bytes())
@@ -504,7 +544,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("stage", choices=["index", "select", "build", "preview"])
     ap.add_argument("--total", type=int, default=20500, help="select: library size")
-    ap.add_argument("--extend", action="store_true", help="select: append EXTRA_FAMILIES to the existing manifest")
+    ap.add_argument("--extend", action="store_true", help="select: append the EXTRA_FAMILIES the manifest lacks")
+    ap.add_argument("--dry-run", action="store_true", help="select --extend: print the picks, don't write")
     ap.add_argument("--manifest", default="library.jsonl")
     ap.add_argument("--limit", type=int, default=0, help="build: only the next N unbuilt rows")
     ap.add_argument("--families", default="", help="preview: comma-separated families (default all)")

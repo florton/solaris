@@ -4,6 +4,8 @@
 # keep their order, so data/mimoid_quality.npz rows stay aligned (it appends
 # the new ones itself). Checks first that re-encoding old forms reproduces
 # their stored latents. The first run keeps the original as mimoid_grid_base.pt.
+# Rows mimoid_orient.py has turned since they were encoded are re-encoded in
+# place (`rot` in the checkpoint = the pose each latent was encoded in).
 # Then: mimoid_captions.py -> mimoid_quality.py -> export_dream.py
 # Run: .venv/Scripts/python scripts/mimoid_encode.py
 import shutil
@@ -14,7 +16,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mimoid_train_ae import GridEncoder, load_all  # noqa: E402
+from mimoid_train_ae import GridEncoder, cache_rot, load_all  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 AE = ROOT / "data" / "mimoid_grid.pt"
@@ -40,24 +42,33 @@ def main():
         raise SystemExit("library order changed: the stored latents are no longer a prefix of library_all")
     if any(not torch.equal(ck["dec"][k], ae["dec"][k]) for k in ae["dec"]):
         raise SystemExit(f"{CKPT.name} is not the checkpoint that made {AE.name}")
-    print(f"{len(uids)} forms · {n_old} encoded · {len(uids) - n_old} new", flush=True)
-    if len(uids) == n_old:
+    # rows mimoid_orient.py turned since they were encoded
+    rot = cache_rot("library")
+    rot_enc = np.asarray(ae.get("rot", np.zeros(n_old, int)))
+    turned = np.nonzero(rot[:n_old] != rot_enc)[0]
+    print(f"{len(uids)} forms · {n_old} encoded · {len(uids) - n_old} new · {len(turned)} turned", flush=True)
+    if len(uids) == n_old and not len(turned):
         return
     enc = GridEncoder(ae["lat_c"]).to(dev).eval()
     enc.load_state_dict(ck["enc"])
 
-    probe = np.arange(0, n_old, max(1, n_old // 64))[:64]
+    same = np.setdiff1d(np.arange(n_old), turned)
+    probe = same[:: max(1, len(same) // 64)][:64]
     err = float((encode(enc, grids, probe, dev) - ae["latents"][probe].float()).abs().max())
     print(f"  re-encoding {len(probe)} stored forms: max |diff| {err:.4f} (latent std ~0.13)", flush=True)
     if err > 0.02:
         raise SystemExit("the encoder doesn't reproduce the stored latents")
 
-    new = encode(enc, grids, np.arange(n_old, len(uids)), dev)
+    new = encode(enc, grids, np.arange(n_old, len(uids)), dev) if len(uids) > n_old else ae["latents"][:0].float()
     base = AE.with_name(AE.stem + "_base.pt")
     if not base.exists():
         shutil.copyfile(AE, base)
-    ae["latents"] = torch.cat([ae["latents"], new.half()])
+    lat = ae["latents"].clone()
+    if len(turned):
+        lat[torch.from_numpy(turned)] = encode(enc, grids, turned, dev).half()
+    ae["latents"] = torch.cat([lat, new.half()])
     ae["uids"] = uids
+    ae["rot"] = rot
     torch.save(ae, AE)
     print(f"-> {AE} ({len(uids)} latents; the pre-extension file is {base.name})")
 
