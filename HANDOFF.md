@@ -500,6 +500,15 @@ pool; from testing, a coke/soda bottle, a teacup and an apple didn't come throug
   `mimoid_quality.py` rescores them (`q["rot"]`). A rerun trains on the turned library and composes its corrections.
 - `main.ts` `show()` resets yaw/pitch to the default view (0.6, 0.25) for every thought; orbiting stays free.
 
+## Batch 2 + orientation applied (2026-10-09)
+- Batch 2 built 21,851 grids (1,949 skipped) in 6.6 h; kept 17,838 → 33,937. Apples 186, soda/coke 205,
+  teacups 23, mugs 226, penguins 80. `library_lat.bin` 52 MB. Disk: 8.8 GB free (`library_all.npy` 12 GB).
+- Up-net retrained on the grown library (40 min): held-out up axis 0.72. Applied at `--margin 0.8`:
+  699 forms stood up. Every turn was reviewed in `previews/mimoid_orient_review_*.png` (sorted by gain; list in
+  `mimoid_orient_review.txt`): ~85–90% right; the remaining error is wall-standing flat things (oven fronts,
+  doors, shields, clock faces) laid flat. Re-encode → quality → export: kept **33,896** (rotated forms
+  rescored, 9 more rotated duplicates caught). Log: `data/mimoid/orient_apply.log`.
+
 ## Next steps
 1. After batch 2: remaining library gaps are fog/mist, stars, whirlpool, wells, canyons.
 2. Confirm wasm threads in real Chrome too (they came up in the in-app browser this session).
